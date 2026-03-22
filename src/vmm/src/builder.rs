@@ -905,6 +905,7 @@ pub(crate) mod tests {
                 ),
                 rate_limiter: None,
                 file_engine_type: None,
+                direct: None,
 
                 socket: None,
             };

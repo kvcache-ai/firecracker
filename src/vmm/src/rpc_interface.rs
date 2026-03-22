@@ -1291,6 +1291,31 @@ mod tests {
                 metrics_path: PathBuf::new(),
             },
         )));
+        check_unsupported(runtime_request(VmmAction::InsertBlockDevice(
+            BlockDeviceConfig {
+                drive_id: String::new(),
+                partuuid: None,
+                is_root_device: false,
+                cache_type: CacheType::Unsafe,
+
+                is_read_only: Some(false),
+                path_on_host: Some(String::new()),
+                rate_limiter: None,
+                file_engine_type: None,
+                direct: None,
+
+                socket: None,
+            },
+        )));
+        check_unsupported(runtime_request(VmmAction::InsertNetworkDevice(
+            NetworkInterfaceConfig {
+                iface_id: String::new(),
+                host_dev_name: String::new(),
+                guest_mac: None,
+                rx_rate_limiter: None,
+                tx_rate_limiter: None,
+            },
+        )));
         check_unsupported(runtime_request(VmmAction::SetVsockDevice(
             VsockDeviceConfig {
                 vsock_id: Some(String::new()),

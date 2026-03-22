@@ -60,6 +60,10 @@ pub struct VirtioBlockState {
     pub virtio_state: VirtioDeviceState,
     rate_limiter_state: RateLimiterState,
     file_engine_type: FileEngineTypeState,
+    /// Whether O_DIRECT was used to open the backing file.
+    /// Uses serde default (false) for backward compatibility with older snapshots.
+    #[serde(default)]
+    direct: bool,
 }
 
 impl Persist<'_> for VirtioBlock {
@@ -78,6 +82,7 @@ impl Persist<'_> for VirtioBlock {
             virtio_state: VirtioDeviceState::from_device(self),
             rate_limiter_state: self.rate_limiter.save(),
             file_engine_type: FileEngineTypeState::from(self.file_engine_type()),
+            direct: self.direct,
         }
     }
 
@@ -93,6 +98,7 @@ impl Persist<'_> for VirtioBlock {
             state.disk_path.clone(),
             is_read_only,
             state.file_engine_type.into(),
+            state.direct,
         )?;
 
         let queue_evts = [EventFd::new(libc::EFD_NONBLOCK).map_err(VirtioBlockError::EventFd)?];
@@ -129,6 +135,7 @@ impl Persist<'_> for VirtioBlock {
             cache_type: state.cache_type,
             root_device: state.root_device,
             read_only: is_read_only,
+            direct: state.direct,
 
             disk: disk_properties,
             rate_limiter,
@@ -162,6 +169,7 @@ mod tests {
             cache_type: CacheType::Writeback,
             rate_limiter: None,
             file_engine_type: FileEngineType::default(),
+            direct: false,
         };
 
         let block = VirtioBlock::new(config).unwrap();
@@ -203,6 +211,7 @@ mod tests {
             cache_type: CacheType::Unsafe,
             rate_limiter: None,
             file_engine_type: FileEngineType::default(),
+            direct: false,
         };
 
         let block = VirtioBlock::new(config).unwrap();
