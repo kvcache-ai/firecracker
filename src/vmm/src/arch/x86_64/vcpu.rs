@@ -12,6 +12,7 @@ use std::sync::Arc;
 use kvm_bindings::{
     CpuId, KVM_MAX_CPUID_ENTRIES, KVM_MAX_MSR_ENTRIES, Msrs, Xsave, kvm_debugregs, kvm_lapic_state,
     kvm_mp_state, kvm_regs, kvm_sregs, kvm_vcpu_events, kvm_xcrs, kvm_xsave, kvm_xsave2,
+    nested::KvmNestedStateBuffer,
 };
 use kvm_ioctls::{VcpuExit, VcpuFd};
 use log::{error, warn};
@@ -68,6 +69,8 @@ pub enum KvmVcpuError {
     VcpuGetMsr(u32),
     /// Failed to get KVM vcpu msrs: {0}
     VcpuGetMsrs(kvm_ioctls::Error),
+    /// Failed to get KVM vcpu nested state: {0}
+    VcpuGetNestedState(kvm_ioctls::Error),
     /// Failed to get KVM vcpu regs: {0}
     VcpuGetRegs(kvm_ioctls::Error),
     /// Failed to get KVM vcpu sregs: {0}
@@ -96,6 +99,8 @@ pub enum KvmVcpuError {
     VcpuSetMsrs(kvm_ioctls::Error),
     /// Failed to set all KVM MSRs for this vCPU. Only a partial write was done.
     VcpuSetMsrsIncomplete,
+    /// Failed to set KVM vcpu nested state: {0}
+    VcpuSetNestedState(kvm_ioctls::Error),
     /// Failed to set KVM vcpu regs: {0}
     VcpuSetRegs(kvm_ioctls::Error),
     /// Failed to set KVM vcpu sregs: {0}
@@ -593,6 +598,12 @@ impl KvmVcpu {
             None
         });
         let cpuid = self.get_cpuid()?;
+        let mut nested_state = KvmNestedStateBuffer::empty();
+        let nested_state = self
+            .fd
+            .nested_state(&mut nested_state)
+            .map_err(KvmVcpuError::VcpuGetNestedState)?
+            .map(|_| nested_state);
         let saved_msrs = self.get_msr_chunks(self.msrs_to_save.iter().copied())?;
         let vcpu_events = self
             .fd
@@ -611,6 +622,7 @@ impl KvmVcpu {
             xcrs,
             xsave,
             tsc_khz,
+            nested_state,
         })
     }
 
@@ -703,6 +715,11 @@ impl KvmVcpu {
         self.fd
             .set_lapic(&state.lapic)
             .map_err(KvmVcpuError::VcpuSetLapic)?;
+        if let Some(nested_state) = state.nested_state.as_ref() {
+            self.fd
+                .set_nested_state(nested_state)
+                .map_err(KvmVcpuError::VcpuSetNestedState)?;
+        }
         for msrs in &state.saved_msrs {
             let nmsrs = self.fd.set_msrs(msrs).map_err(KvmVcpuError::VcpuSetMsrs)?;
             if nmsrs < msrs.as_fam_struct_ref().nmsrs as usize {
@@ -781,6 +798,8 @@ pub struct VcpuState {
     pub xsave: Xsave,
     /// Tsc khz.
     pub tsc_khz: Option<u32>,
+    /// Nested guest state.
+    pub nested_state: Option<KvmNestedStateBuffer>,
 }
 
 impl Debug for VcpuState {
@@ -802,6 +821,13 @@ impl Debug for VcpuState {
             .field("xcrs", &self.xcrs)
             .field("xsave", &self.xsave)
             .field("tsc_khz", &self.tsc_khz)
+            .field(
+                "nested_state",
+                &self
+                    .nested_state
+                    .as_ref()
+                    .map(|state| (state.format, state.flags, state.size)),
+            )
             .finish()
     }
 }
@@ -840,6 +866,7 @@ mod tests {
                 xcrs: Default::default(),
                 xsave: Xsave::new(0).unwrap(),
                 tsc_khz: Some(0),
+                nested_state: None,
             }
         }
     }

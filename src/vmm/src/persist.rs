@@ -160,8 +160,8 @@ pub enum CreateSnapshotError {
     SnapshotBackingFile(&'static str, io::Error),
 }
 
-/// Snapshot version
-pub const SNAPSHOT_VERSION: Version = Version::new(9, 0, 0);
+/// Snapshot version.
+pub const SNAPSHOT_VERSION: Version = Version::new(1000, 0, 0);
 
 /// Creates a Microvm snapshot.
 pub fn create_snapshot(
