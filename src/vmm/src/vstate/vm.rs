@@ -29,12 +29,13 @@ use crate::arch::{GSI_MSI_END, host_page_size};
 use crate::logger::info;
 use crate::pci::{DeviceRelocation, DeviceRelocationError, PciDevice};
 use crate::persist::CreateSnapshotError;
+use crate::utils::get_page_size;
 use crate::vmm_config::snapshot::SnapshotType;
 use crate::vstate::bus::Bus;
 use crate::vstate::interrupts::{InterruptError, MsixVector, MsixVectorConfig, MsixVectorGroup};
 use crate::vstate::memory::{
-    GuestMemory, GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion, GuestMemoryState,
-    GuestRegionMmap, GuestRegionMmapExt, MemoryError,
+    DirtyMemoryRanges, GuestMemory, GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion,
+    GuestMemoryState, GuestRegionMmap, GuestRegionMmapExt, MemoryError,
 };
 use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vcpu::VcpuError;
@@ -323,6 +324,21 @@ impl Vm {
                 Ok((mem_slot.slot, bitmap))
             })
             .collect()
+    }
+
+    /// Returns dirty memory ranges without logically clearing dirty state.
+    ///
+    /// Reading KVM's dirty log clears KVM's internal bits. Preserve those bits
+    /// in Firecracker's internal bitmap before returning the ranges so a later
+    /// snapshot still sees the pages if the external consumer fails.
+    pub fn get_dirty_memory_ranges_preserve(&self) -> Result<DirtyMemoryRanges, VmError> {
+        let dirty_bitmap = self.get_dirty_bitmap()?;
+        let page_size = get_page_size().map_err(MemoryError::PageSize)?;
+        self.guest_memory()
+            .store_dirty_bitmap(&dirty_bitmap, page_size);
+        self.guest_memory()
+            .dirty_memory_ranges(&dirty_bitmap, page_size)
+            .map_err(VmError::MemoryError)
     }
 
     /// Takes a snapshot of the virtual machine running inside the given [`Vmm`] and saves it to

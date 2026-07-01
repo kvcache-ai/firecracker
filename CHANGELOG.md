@@ -8,6 +8,12 @@ and this project adheres to
 
 ## [1.15.1]
 
+### Added
+
+- [#XXXX](https://github.com/firecracker-microvm/firecracker/pull/XXXX): Add
+  runtime `GET /vm/dirty-memory-ranges` API for querying dirty guest memory
+  ranges without first dumping the guest memory snapshot to a file.
+
 ### Fixed
 
 - [#5762](https://github.com/firecracker-microvm/firecracker/pull/5762): Cap
