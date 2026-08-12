@@ -124,6 +124,9 @@ use std::time::Duration;
 
 use device_manager::DeviceManager;
 use event_manager::{EventManager as BaseEventManager, EventOps, Events, MutEventSubscriber};
+#[cfg(target_arch = "x86_64")]
+use kvm_bindings::KVM_CAP_PRE_FAULT_MEMORY;
+use seccomp::BpfProgram;
 use snapshot::Persist;
 use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::terminal::Terminal;
@@ -160,7 +163,15 @@ use crate::vmm_config::mmds::MmdsConfig;
 use crate::vmm_config::net::NetworkInterfaceConfig;
 use crate::vmm_config::vsock::VsockDeviceConfig;
 pub use crate::vstate::kvm::Kvm;
-use crate::vstate::memory::{GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
+use crate::vstate::memory::{
+    GuestAddress, GuestMemory, GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion,
+};
+use crate::vstate::prefault::{PreFaultMemoryError, PreFaultMemoryRequest};
+#[cfg(target_arch = "x86_64")]
+use crate::vstate::prefault::{
+    PreFaultMemoryStats, drain_pre_fault_responses, send_pre_fault_events,
+    split_pre_fault_ranges,
+};
 #[cfg(target_arch = "aarch64")]
 use crate::vstate::vcpu::VcpuState;
 pub use crate::vstate::vcpu::{Vcpu, VcpuConfig, VcpuEvent, VcpuHandle, VcpuResponse};
@@ -479,6 +490,97 @@ impl Vmm {
         kvm_vm.pause_vcpus()?;
         self.instance_info.state = VmState::Paused;
         Ok(())
+    }
+
+    /// Pre-faults selected guest memory while all vCPUs remain paused.
+    pub fn pre_fault_memory(
+        &mut self,
+        request: PreFaultMemoryRequest,
+    ) -> Result<(), PreFaultMemoryError> {
+        let stats = request.validate()?;
+
+        if self.instance_info.state != VmState::Paused {
+            return Err(PreFaultMemoryError::VmNotPaused(
+                self.instance_info.state.clone(),
+            ));
+        }
+        let kvm_vm = self.vm.as_kvm().expect("VMM must hold a KVM VM");
+        if kvm_vm.vcpus_handles().is_empty() {
+            return Err(PreFaultMemoryError::NoVcpus);
+        }
+
+        for (index, range) in request.ranges.iter().enumerate() {
+            if !kvm_vm
+                .guest_memory()
+                .is_range_fully_plugged(GuestAddress(range.gpa), range.size)
+            {
+                return Err(PreFaultMemoryError::NotGuestRam(index));
+            }
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.pre_fault_memory_x86(request, stats)
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            let _ = (request, stats);
+            Err(PreFaultMemoryError::UnsupportedArchitecture)
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn pre_fault_memory_x86(
+        &mut self,
+        request: PreFaultMemoryRequest,
+        stats: PreFaultMemoryStats,
+    ) -> Result<(), PreFaultMemoryError> {
+        let kvm_vm = self.vm.as_kvm().expect("VMM must hold a KVM VM");
+        if kvm_vm
+            .kvm()
+            .fd
+            .check_extension_raw(u64::from(KVM_CAP_PRE_FAULT_MEMORY))
+            == 0
+        {
+            return Err(PreFaultMemoryError::CapabilityMissing);
+        }
+
+        let handles = kvm_vm.vcpus_handles();
+        let work = split_pre_fault_ranges(&request.ranges, handles.len())?;
+        let vcpu_count_u64 =
+            u64::try_from(handles.len()).expect("vCPU count exceeds u64");
+        let expected_worker_count = if stats.total_pages < vcpu_count_u64 {
+            usize::try_from(stats.total_pages).expect("page count does not fit in usize")
+        } else {
+            handles.len()
+        };
+        debug_assert_eq!(work.len(), expected_worker_count);
+
+        // Send every work queue before waiting for any response. This lets the kernel fault pages
+        // on all vCPU threads concurrently.
+        let send_error = send_pre_fault_events(&work, |vcpu_id, ranges| {
+            handles[vcpu_id].send_event(VcpuEvent::PreFaultMemory(ranges))
+        });
+        let mut first_error = send_error.map(|(vcpu_id, source)| {
+            PreFaultMemoryError::VcpuSend { vcpu_id, source }
+        });
+
+        // Drain every response for every worker whose send_event call returned, even after one
+        // worker fails. Completed kernel work is intentionally not rolled back. This is a
+        // blocking receive because a fixed timeout could leave a completed response queued and
+        // have the next Resume/Save operation consume it.
+        let response_error = drain_pre_fault_responses(work.len(), |vcpu_id| {
+            handles[vcpu_id].response_receiver().recv()
+        });
+        if first_error.is_none() {
+            first_error = response_error;
+        }
+
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// Injects CTRL+ALT+DEL keystroke combo in the i8042 device.
