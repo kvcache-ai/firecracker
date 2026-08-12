@@ -27,9 +27,9 @@ use crate::seccomp::{BpfProgram, BpfProgramRef};
 use crate::utils::signal::{Killable, register_signal_handler, sigrtmin};
 use crate::utils::sm::StateMachine;
 use crate::vstate::bus::Bus;
-use crate::vstate::prefault::{PreFaultMemoryIoctlError, PreFaultMemoryRange};
 #[cfg(target_arch = "x86_64")]
 use crate::vstate::prefault::pre_fault_memory;
+use crate::vstate::prefault::{PreFaultMemoryIoctlError, PreFaultMemoryRange};
 use crate::vstate::vm::KvmVm;
 
 /// Signal number (SIGRTMIN) used to kick Vcpus.
@@ -365,7 +365,7 @@ impl Vcpu {
             }
             #[cfg(target_arch = "x86_64")]
             Ok(VcpuEvent::PreFaultMemory(ranges)) => {
-                pre_fault_memory(&self.kvm_vcpu.fd, self.kvm_vcpu.index, &ranges)
+                pre_fault_memory(&self.kvm_vcpu.fd, &ranges)
                     .map(|()| {
                         self.response_sender
                             .send(VcpuResponse::PreFaultMemoryCompleted)

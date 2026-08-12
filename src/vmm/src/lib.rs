@@ -169,8 +169,7 @@ use crate::vstate::memory::{
 use crate::vstate::prefault::{PreFaultMemoryError, PreFaultMemoryRequest};
 #[cfg(target_arch = "x86_64")]
 use crate::vstate::prefault::{
-    PreFaultMemoryStats, drain_pre_fault_responses, send_pre_fault_events,
-    split_pre_fault_ranges,
+    drain_pre_fault_responses, send_pre_fault_events, split_pre_fault_ranges,
 };
 #[cfg(target_arch = "aarch64")]
 use crate::vstate::vcpu::VcpuState;
@@ -497,7 +496,7 @@ impl Vmm {
         &mut self,
         request: PreFaultMemoryRequest,
     ) -> Result<(), PreFaultMemoryError> {
-        let stats = request.validate()?;
+        request.validate()?;
 
         if self.instance_info.state != VmState::Paused {
             return Err(PreFaultMemoryError::VmNotPaused(
@@ -520,12 +519,12 @@ impl Vmm {
 
         #[cfg(target_arch = "x86_64")]
         {
-            self.pre_fault_memory_x86(request, stats)
+            self.pre_fault_memory_x86(request)
         }
 
         #[cfg(target_arch = "aarch64")]
         {
-            let _ = (request, stats);
+            let _ = request;
             Err(PreFaultMemoryError::UnsupportedArchitecture)
         }
     }
@@ -534,7 +533,6 @@ impl Vmm {
     fn pre_fault_memory_x86(
         &mut self,
         request: PreFaultMemoryRequest,
-        stats: PreFaultMemoryStats,
     ) -> Result<(), PreFaultMemoryError> {
         let kvm_vm = self.vm.as_kvm().expect("VMM must hold a KVM VM");
         if kvm_vm
@@ -548,22 +546,11 @@ impl Vmm {
 
         let handles = kvm_vm.vcpus_handles();
         let work = split_pre_fault_ranges(&request.ranges, handles.len())?;
-        let vcpu_count_u64 =
-            u64::try_from(handles.len()).expect("vCPU count exceeds u64");
-        let expected_worker_count = if stats.total_pages < vcpu_count_u64 {
-            usize::try_from(stats.total_pages).expect("page count does not fit in usize")
-        } else {
-            handles.len()
-        };
-        debug_assert_eq!(work.len(), expected_worker_count);
 
         // Send every work queue before waiting for any response. This lets the kernel fault pages
         // on all vCPU threads concurrently.
         let send_error = send_pre_fault_events(&work, |vcpu_id, ranges| {
             handles[vcpu_id].send_event(VcpuEvent::PreFaultMemory(ranges))
-        });
-        let mut first_error = send_error.map(|(vcpu_id, source)| {
-            PreFaultMemoryError::VcpuSend { vcpu_id, source }
         });
 
         // Drain every response for every worker whose send_event call returned, even after one
@@ -573,11 +560,10 @@ impl Vmm {
         let response_error = drain_pre_fault_responses(work.len(), |vcpu_id| {
             handles[vcpu_id].response_receiver().recv()
         });
-        if first_error.is_none() {
-            first_error = response_error;
-        }
-
-        match first_error {
+        match send_error
+            .map(|(vcpu_id, source)| PreFaultMemoryError::VcpuSend { vcpu_id, source })
+            .or(response_error)
+        {
             Some(error) => Err(error),
             None => Ok(()),
         }

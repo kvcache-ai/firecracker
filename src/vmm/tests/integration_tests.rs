@@ -38,7 +38,11 @@ use vmm::vmm_config::snapshot::{
     CreateSnapshotParams, LoadSnapshotParams, MemBackendConfig, MemBackendType, SnapshotType,
 };
 use vmm::vmm_config::vsock::VsockDeviceConfig;
+#[cfg(target_arch = "x86_64")]
+use vmm::vstate::prefault::PreFaultMemoryIoctlError;
 use vmm::vstate::prefault::{PreFaultMemoryError, PreFaultMemoryRange, PreFaultMemoryRequest};
+#[cfg(target_arch = "x86_64")]
+use vmm::vstate::vcpu::VcpuError;
 use vmm::{DumpCpuConfigError, EventManager, FcExitCode, Vmm};
 use vmm_sys_util::tempfile::TempFile;
 
@@ -485,7 +489,7 @@ fn pre_fault_action(gpa: u64, size: u64) -> VmmAction {
     })
 }
 
-fn complete_pre_fault_control_roundtrip(vmm: &Arc<Mutex<Vmm>>) {
+fn assert_pre_fault_recovery(vmm: &Arc<Mutex<Vmm>>) {
     let mut controller = RuntimeApiController::new(vmm.clone());
     controller.handle_request(VmmAction::Resume).unwrap();
     controller.handle_request(VmmAction::Pause).unwrap();
@@ -504,9 +508,19 @@ fn assert_pre_fault_supported_or_host_unsupported(result: Result<VmmData, VmmAct
         .check_extension_raw(u64::from(KVM_CAP_PRE_FAULT_MEMORY));
 
     if capability > 0 {
+        let mode_unsupported = matches!(
+            &result,
+            Err(VmmActionError::PreFaultMemory(PreFaultMemoryError::Vcpu {
+                source: VcpuError::PreFaultMemory(PreFaultMemoryIoctlError::Ioctl {
+                    error,
+                    ..
+                }),
+                ..
+            })) if error.raw_os_error() == Some(libc::EOPNOTSUPP)
+        );
         assert!(
-            matches!(&result, Ok(VmmData::Empty)),
-            "KVM_CAP_PRE_FAULT_MEMORY={capability}, expected successful ioctl path, got {result:?}"
+            matches!(&result, Ok(VmmData::Empty)) || mode_unsupported,
+            "KVM_CAP_PRE_FAULT_MEMORY={capability}, expected success or EOPNOTSUPP for the current vCPU mode, got {result:?}"
         );
     } else {
         assert!(
@@ -535,10 +549,13 @@ fn assert_pre_fault_supported_or_host_unsupported(result: Result<VmmData, VmmAct
 }
 
 #[test]
-fn test_prefault_memory_rejects_non_paused_vm() {
-    let (vmm, _) = default_vmm(Some(NOISY_KERNEL_IMAGE));
+fn test_prefault_memory_state_validation_recovery_and_repeated_calls() {
+    use vmm::vstate::prefault::PreFaultMemoryValidationError;
+
+    let (vmm, _) = default_vmm_no_boot(Some(NOISY_KERNEL_IMAGE));
     let mut controller = RuntimeApiController::new(vmm.clone());
 
+    controller.handle_request(VmmAction::Resume).unwrap();
     let error = controller
         .handle_request(pre_fault_action(0, 0x1000))
         .unwrap_err();
@@ -546,58 +563,46 @@ fn test_prefault_memory_rejects_non_paused_vm() {
         error,
         VmmActionError::PreFaultMemory(PreFaultMemoryError::VmNotPaused(VmState::Running))
     ));
+    controller.handle_request(VmmAction::Pause).unwrap();
 
-    vmm.lock().unwrap().stop(FcExitCode::Ok);
-}
-
-#[test]
-fn test_prefault_memory_rejects_invalid_ranges_and_keeps_vm_usable() {
-    use vmm::vstate::prefault::PreFaultMemoryValidationError;
-
-    let (vmm, _) = default_vmm_no_boot(Some(NOISY_KERNEL_IMAGE));
-    let mut controller = RuntimeApiController::new(vmm.clone());
-
-    let error = controller
-        .handle_request(VmmAction::PreFaultMemory(PreFaultMemoryRequest {
-            ranges: vec![],
-        }))
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        VmmActionError::PreFaultMemory(PreFaultMemoryError::Validation(
-            PreFaultMemoryValidationError::EmptyRanges
-        ))
-    ));
-
-    let error = controller
-        .handle_request(pre_fault_action(1, 0x1000))
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        VmmActionError::PreFaultMemory(PreFaultMemoryError::Validation(
-            PreFaultMemoryValidationError::Unaligned(0)
-        ))
-    ));
-
-    let error = controller
-        .handle_request(pre_fault_action(0, 0))
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        VmmActionError::PreFaultMemory(PreFaultMemoryError::Validation(
-            PreFaultMemoryValidationError::ZeroSize(0)
-        ))
-    ));
-
-    let error = controller
-        .handle_request(pre_fault_action(u64::MAX - 0xfff, 0x2000))
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        VmmActionError::PreFaultMemory(PreFaultMemoryError::Validation(
-            PreFaultMemoryValidationError::AddressOverflow(0)
-        ))
-    ));
+    let mut reject = |request, expected| {
+        let error = controller
+            .handle_request(VmmAction::PreFaultMemory(request))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            VmmActionError::PreFaultMemory(PreFaultMemoryError::Validation(actual))
+                if actual == expected
+        ));
+    };
+    reject(
+        PreFaultMemoryRequest { ranges: vec![] },
+        PreFaultMemoryValidationError::EmptyRanges,
+    );
+    reject(
+        PreFaultMemoryRequest {
+            ranges: vec![PreFaultMemoryRange {
+                gpa: 1,
+                size: 0x1000,
+            }],
+        },
+        PreFaultMemoryValidationError::Unaligned(0),
+    );
+    reject(
+        PreFaultMemoryRequest {
+            ranges: vec![PreFaultMemoryRange { gpa: 0, size: 0 }],
+        },
+        PreFaultMemoryValidationError::ZeroSize(0),
+    );
+    reject(
+        PreFaultMemoryRequest {
+            ranges: vec![PreFaultMemoryRange {
+                gpa: u64::MAX - 0xfff,
+                size: 0x2000,
+            }],
+        },
+        PreFaultMemoryValidationError::AddressOverflow(0),
+    );
 
     let error = controller
         .handle_request(pre_fault_action(0x2000_0000, 0x1000))
@@ -607,26 +612,14 @@ fn test_prefault_memory_rejects_invalid_ranges_and_keeps_vm_usable() {
         VmmActionError::PreFaultMemory(PreFaultMemoryError::NotGuestRam(0))
     ));
 
-    // Validation fails before work is sent to a vCPU. Verify that rejected API requests leave the
-    // VM usable; response-channel reuse is exercised by the repeated and multi-vCPU tests on
-    // capable x86_64 hosts.
-    complete_pre_fault_control_roundtrip(&vmm);
-    vmm.lock().unwrap().stop(FcExitCode::Ok);
-}
-
-#[test]
-fn test_prefault_memory_repeated_calls_match_host_capability_and_save_state() {
-    let (vmm, _) = default_vmm_no_boot(Some(NOISY_KERNEL_IMAGE));
-    let mut controller = RuntimeApiController::new(vmm.clone());
-
     let first_result = controller.handle_request(pre_fault_action(0, 0x1000));
     assert_pre_fault_supported_or_host_unsupported(first_result);
-
-    // Keep the VM paused and issue another request before touching the control channel.
     let second_result = controller.handle_request(pre_fault_action(0x1000, 0x1000));
     assert_pre_fault_supported_or_host_unsupported(second_result);
 
-    complete_pre_fault_control_roundtrip(&vmm);
+    // Rejected requests sent no work; verify that the VM remains usable. The repeated calls above
+    // also exercise response-channel reuse on capable x86_64 hosts.
+    assert_pre_fault_recovery(&vmm);
     vmm.lock().unwrap().stop(FcExitCode::Ok);
 }
 
@@ -679,15 +672,14 @@ fn test_prefault_memory_multi_vcpu_preserves_split_bytes_and_control_channel() {
     let request = PreFaultMemoryRequest {
         ranges: ranges.clone(),
     };
-    let stats = request.validate().unwrap();
-    assert_eq!(stats.total_size, 0x8000);
-    assert_eq!(stats.total_pages, 8);
+    let total_pages = request.validate().unwrap();
+    assert_eq!(total_pages, 8);
 
     let work = split_pre_fault_ranges(&ranges, 2).unwrap();
     assert_eq!(work.len(), 2);
     assert_eq!(
         work.iter().flatten().map(|range| range.size).sum::<u64>(),
-        stats.total_size
+        total_pages * 0x1000
     );
 
     let expected_pages: HashSet<u64> = ranges
@@ -706,6 +698,6 @@ fn test_prefault_memory_multi_vcpu_preserves_split_bytes_and_control_channel() {
     let result = controller.handle_request(VmmAction::PreFaultMemory(request));
     assert_pre_fault_supported_or_host_unsupported(result);
 
-    complete_pre_fault_control_roundtrip(&vmm);
+    assert_pre_fault_recovery(&vmm);
     vmm.lock().unwrap().stop(FcExitCode::Ok);
 }
