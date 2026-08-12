@@ -1058,15 +1058,20 @@ mod tests {
     #[test]
     fn test_range_fully_plugged_rejects_holes_and_unplugged_slots() {
         let regions = anonymous(
-            [(GuestAddress(0), 0x2000), (GuestAddress(0x4000), 0x2000)].into_iter(),
+            [
+                (GuestAddress(0), 0x2000),
+                (GuestAddress(0x2000), 0x2000),
+                (GuestAddress(0x6000), 0x2000),
+            ]
+            .into_iter(),
             false,
             HugePageConfig::None,
         )
         .unwrap();
         let guest_memory = into_region_ext(regions);
-        assert!(guest_memory.is_range_fully_plugged(GuestAddress(0), 0x2000));
-        assert!(!guest_memory.is_range_fully_plugged(GuestAddress(0x1000), 0x4000));
-        assert!(guest_memory.is_range_fully_plugged(GuestAddress(0x4000), 0x2000));
+        assert!(guest_memory.is_range_fully_plugged(GuestAddress(0), 0x4000));
+        assert!(!guest_memory.is_range_fully_plugged(GuestAddress(0x1000), 0x5000));
+        assert!(guest_memory.is_range_fully_plugged(GuestAddress(0x6000), 0x2000));
 
         let hotplug_region = anonymous(
             [(GuestAddress(0x8000), 0x2000)].into_iter(),
@@ -1076,10 +1081,13 @@ mod tests {
         .unwrap()
         .pop()
         .unwrap();
-        let hotplug_memory = GuestMemoryMmap::from_regions(vec![
-            GuestRegionMmapExt::hotpluggable_from_mmap_region(hotplug_region, 0, 0x1000),
-        ])
-        .unwrap();
+        let hotplug_memory =
+            GuestMemoryMmap::from_regions(vec![GuestRegionMmapExt::hotpluggable_from_mmap_region(
+                hotplug_region,
+                0,
+                0x1000,
+            )])
+            .unwrap();
         assert!(!hotplug_memory.is_range_fully_plugged(GuestAddress(0x8000), 0x1000));
     }
 

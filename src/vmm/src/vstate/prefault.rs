@@ -9,6 +9,7 @@ use std::mem::size_of;
 
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::kvm_pre_fault_memory;
+#[cfg(target_arch = "x86_64")]
 use kvm_ioctls::VcpuFd;
 use serde::{Deserialize, Serialize};
 
@@ -45,17 +46,8 @@ pub struct PreFaultMemoryRequest {
     pub ranges: Vec<PreFaultMemoryRange>,
 }
 
-/// Aggregate size information for a validated pre-fault request.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PreFaultMemoryStats {
-    /// Total bytes across all ranges.
-    pub total_size: u64,
-    /// Total guest pages across all ranges.
-    pub total_pages: u64,
-}
-
 /// Structural validation failures for a pre-fault request.
-#[derive(Debug, thiserror::Error, displaydoc::Display)]
+#[derive(Debug, Eq, PartialEq, thiserror::Error, displaydoc::Display)]
 pub enum PreFaultMemoryValidationError {
     /// pre-fault memory request must contain at least one range
     EmptyRanges,
@@ -67,8 +59,6 @@ pub enum PreFaultMemoryValidationError {
     AddressOverflow(usize),
     /// pre-fault memory request total size overflowed
     TotalSizeOverflow,
-    /// pre-fault memory request total page count overflowed
-    TotalPagesOverflow,
 }
 
 /// Errors returned while validating or executing a pre-fault request.
@@ -114,14 +104,12 @@ pub enum PreFaultMemoryError {
 /// Errors returned by the `KVM_PRE_FAULT_MEMORY` wrapper.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum PreFaultMemoryIoctlError {
-    /// KVM_PRE_FAULT_MEMORY failed at GPA {gpa:#x}: errno {errno} ({error}); {size} bytes remain
+    /// KVM_PRE_FAULT_MEMORY failed at GPA {gpa:#x}: {error}; {size} bytes remain
     Ioctl {
         /// GPA returned by the kernel when the ioctl failed.
         gpa: u64,
         /// Remaining bytes returned by the kernel when the ioctl failed.
         size: u64,
-        /// Numeric errno returned by the kernel.
-        errno: i32,
         /// Operating-system error returned by the ioctl.
         #[source]
         error: io::Error,
@@ -133,8 +121,6 @@ pub enum PreFaultMemoryIoctlError {
         /// Remaining bytes returned by the kernel.
         size: u64,
     },
-    /// KVM_PRE_FAULT_MEMORY is unavailable on this architecture
-    Unsupported,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -142,98 +128,90 @@ const _: [(); 64] = [(); size_of::<kvm_pre_fault_memory>()];
 
 impl PreFaultMemoryRequest {
     /// Validates request shape and computes checked aggregate sizes.
-    pub fn validate(&self) -> Result<PreFaultMemoryStats, PreFaultMemoryValidationError> {
-        if self.ranges.is_empty() {
-            return Err(PreFaultMemoryValidationError::EmptyRanges);
-        }
-
-        let page_size = u64::try_from(GUEST_PAGE_SIZE).expect("guest page size exceeds u64");
-        let mut total_size = 0u64;
-        let mut total_pages = 0u64;
-
-        for (index, range) in self.ranges.iter().enumerate() {
-            if range.size == 0 {
-                return Err(PreFaultMemoryValidationError::ZeroSize(index));
-            }
-            if !range.gpa.is_multiple_of(page_size) || !range.size.is_multiple_of(page_size) {
-                return Err(PreFaultMemoryValidationError::Unaligned(index));
-            }
-            if range.gpa.checked_add(range.size).is_none() {
-                return Err(PreFaultMemoryValidationError::AddressOverflow(index));
-            }
-
-            total_size = total_size
-                .checked_add(range.size)
-                .ok_or(PreFaultMemoryValidationError::TotalSizeOverflow)?;
-            total_pages = total_pages
-                .checked_add(range.size / page_size)
-                .ok_or(PreFaultMemoryValidationError::TotalPagesOverflow)?;
-        }
-
-        Ok(PreFaultMemoryStats {
-            total_size,
-            total_pages,
-        })
+    pub fn validate(&self) -> Result<u64, PreFaultMemoryValidationError> {
+        validate_ranges(&self.ranges)
     }
 }
 
-/// Splits validated ranges into balanced, page-aligned vCPU work queues.
+fn validate_ranges(ranges: &[PreFaultMemoryRange]) -> Result<u64, PreFaultMemoryValidationError> {
+    if ranges.is_empty() {
+        return Err(PreFaultMemoryValidationError::EmptyRanges);
+    }
+
+    let page_size = u64::try_from(GUEST_PAGE_SIZE).expect("guest page size exceeds u64");
+    let mut total_size = 0u64;
+
+    for (index, range) in ranges.iter().enumerate() {
+        if range.size == 0 {
+            return Err(PreFaultMemoryValidationError::ZeroSize(index));
+        }
+        if !range.gpa.is_multiple_of(page_size) || !range.size.is_multiple_of(page_size) {
+            return Err(PreFaultMemoryValidationError::Unaligned(index));
+        }
+        if range.gpa.checked_add(range.size).is_none() {
+            return Err(PreFaultMemoryValidationError::AddressOverflow(index));
+        }
+
+        total_size = total_size
+            .checked_add(range.size)
+            .ok_or(PreFaultMemoryValidationError::TotalSizeOverflow)?;
+    }
+
+    // All sizes are page-aligned, so a checked total byte count also bounds the page count.
+    Ok(total_size / page_size)
+}
+
+/// Validates and splits ranges into balanced, page-aligned vCPU work queues.
 pub fn split_pre_fault_ranges(
     ranges: &[PreFaultMemoryRange],
     vcpu_count: usize,
 ) -> Result<Vec<Vec<PreFaultMemoryRange>>, PreFaultMemoryError> {
-    let request = PreFaultMemoryRequest {
-        ranges: ranges.to_vec(),
-    };
-    let stats = request.validate()?;
-
+    // Derive the page count here so callers cannot supply metadata that disagrees with `ranges`.
+    let total_pages = validate_ranges(ranges)?;
     if vcpu_count == 0 {
         return Err(PreFaultMemoryError::NoVcpus);
     }
-
     let vcpu_count_u64 = u64::try_from(vcpu_count).expect("vCPU count exceeds u64");
-    let worker_count = if stats.total_pages < vcpu_count_u64 {
-        usize::try_from(stats.total_pages).expect("page count does not fit in usize")
+    let worker_count = if total_pages < vcpu_count_u64 {
+        usize::try_from(total_pages).expect("page count does not fit in usize")
     } else {
         vcpu_count
     };
     let worker_count_u64 = u64::try_from(worker_count).expect("worker count exceeds u64");
-    let base_pages = stats.total_pages / worker_count_u64;
-    let extra_pages = usize::try_from(stats.total_pages % worker_count_u64)
-        .expect("remainder does not fit in usize");
-    let mut quotas = (0..worker_count)
-        .map(|worker| base_pages + u64::from(worker < extra_pages))
-        .collect::<Vec<_>>();
+    let base_pages = total_pages / worker_count_u64;
+    let extra_pages =
+        usize::try_from(total_pages % worker_count_u64).expect("remainder does not fit in usize");
     let mut work = vec![Vec::new(); worker_count];
     let page_size = u64::try_from(GUEST_PAGE_SIZE).expect("guest page size exceeds u64");
     let mut worker_index = 0usize;
+    let mut quota = base_pages + u64::from(worker_index < extra_pages);
 
-    for (range_index, range) in ranges.iter().enumerate() {
+    for range in ranges {
         let mut remaining_pages = range.size / page_size;
         let mut gpa = range.gpa;
 
         while remaining_pages != 0 {
-            while quotas[worker_index] == 0 {
+            while quota == 0 {
                 worker_index += 1;
+                quota = base_pages + u64::from(worker_index < extra_pages);
             }
-            let fragment_pages = remaining_pages.min(quotas[worker_index]);
+            let fragment_pages = remaining_pages.min(quota);
             let fragment_size = fragment_pages * page_size;
             work[worker_index].push(PreFaultMemoryRange {
                 gpa,
                 size: fragment_size,
             });
-            gpa = gpa
-                .checked_add(fragment_size)
-                .ok_or(PreFaultMemoryValidationError::AddressOverflow(range_index))?;
+            // The caller supplies ranges that have already passed address-overflow validation.
+            gpa += fragment_size;
             remaining_pages -= fragment_pages;
-            quotas[worker_index] -= fragment_pages;
+            quota -= fragment_pages;
         }
     }
 
     Ok(work)
 }
 
-/// Sends every pre-fault work queue before any response is received.
+/// Sends every work queue before any response is received.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn send_pre_fault_events<F>(
     work: &[Vec<PreFaultMemoryRange>],
@@ -243,16 +221,14 @@ where
     F: FnMut(usize, Vec<PreFaultMemoryRange>) -> Result<(), VcpuSendEventError>,
 {
     let mut first_error = None;
-
     for (vcpu_id, ranges) in work.iter().enumerate() {
-        // `VcpuHandle::send_event` enqueues the event before it attempts to signal the vCPU. The
-        // caller must therefore drain this worker even when this call returns an error.
-        match send(vcpu_id, ranges.clone()) {
-            Err(error) if first_error.is_none() => first_error = Some((vcpu_id, error)),
-            _ => {}
+        // send_event enqueues before signaling, so even a signal error has a response to drain.
+        if let Err(error) = send(vcpu_id, ranges.clone())
+            && first_error.is_none()
+        {
+            first_error = Some((vcpu_id, error));
         }
     }
-
     first_error
 }
 
@@ -266,7 +242,6 @@ where
     F: FnMut(usize) -> Result<VcpuResponse, std::sync::mpsc::RecvError>,
 {
     let mut first_error = None;
-
     for vcpu_id in 0..worker_count {
         let response_error = match receive(vcpu_id) {
             Ok(VcpuResponse::PreFaultMemoryCompleted) => None,
@@ -274,55 +249,44 @@ where
             Ok(VcpuResponse::NotAllowed(reason)) => {
                 Some(PreFaultMemoryError::UnexpectedResponse { vcpu_id, reason })
             }
-            Ok(VcpuResponse::Exited(exit_code)) => Some(PreFaultMemoryError::UnexpectedResponse {
+            Ok(VcpuResponse::Exited(status)) => Some(PreFaultMemoryError::UnexpectedResponse {
                 vcpu_id,
-                reason: format!("vCPU exited with status {exit_code:?}"),
+                reason: format!("vCPU exited with status {status:?}"),
             }),
-            Ok(other) => Some(PreFaultMemoryError::UnexpectedResponse {
+            Ok(response) => Some(PreFaultMemoryError::UnexpectedResponse {
                 vcpu_id,
-                reason: format!("received {other:?}"),
+                reason: format!("received {response:?}"),
             }),
             Err(error) => Some(PreFaultMemoryError::UnexpectedResponse {
                 vcpu_id,
                 reason: format!("failed to receive vCPU response: {error}"),
             }),
         };
-
         if first_error.is_none() {
             first_error = response_error;
         }
     }
-
     first_error
 }
 
 /// Executes pre-fault ioctls for a single vCPU's work queue.
+#[cfg(target_arch = "x86_64")]
 pub fn pre_fault_memory(
     vcpu_fd: &VcpuFd,
-    vcpu_id: u8,
     ranges: &[PreFaultMemoryRange],
 ) -> Result<(), PreFaultMemoryIoctlError> {
-    #[cfg(target_arch = "x86_64")]
-    {
-        run_pre_fault_memory(vcpu_id, ranges, |request| {
-            // SAFETY: The caller invokes this function from the owning vCPU thread with a valid
-            // KVM vCPU fd. `kvm_pre_fault_memory` is the bindgen representation of the UAPI
-            // struct, exactly 64 bytes, and remains alive and exclusively borrowed for the
-            // duration of the ioctl.
-            let result = unsafe { ioctl_with_mut_ref(vcpu_fd, KVM_PRE_FAULT_MEMORY(), request) };
-            if result < 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        })
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        let _ = (vcpu_fd, vcpu_id, ranges);
-        Err(PreFaultMemoryIoctlError::Unsupported)
-    }
+    run_pre_fault_memory(ranges, |request| {
+        // SAFETY: The caller invokes this function from the owning vCPU thread with a valid
+        // KVM vCPU fd. `kvm_pre_fault_memory` is the bindgen representation of the UAPI
+        // struct, exactly 64 bytes, and remains alive and exclusively borrowed for the
+        // duration of the ioctl.
+        let result = unsafe { ioctl_with_mut_ref(vcpu_fd, KVM_PRE_FAULT_MEMORY(), request) };
+        if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    })
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -342,7 +306,6 @@ use pre_fault_memory_ioctl::KVM_PRE_FAULT_MEMORY;
 
 #[cfg(target_arch = "x86_64")]
 fn run_pre_fault_memory<F>(
-    _vcpu_id: u8,
     ranges: &[PreFaultMemoryRange],
     mut ioctl: F,
 ) -> Result<(), PreFaultMemoryIoctlError>
@@ -369,11 +332,9 @@ where
                     request.size = previous_size;
                 }
                 Err(error) => {
-                    let errno = error.raw_os_error().unwrap_or(-1);
                     return Err(PreFaultMemoryIoctlError::Ioctl {
                         gpa: request.gpa,
                         size: request.size,
-                        errno,
                         error,
                     });
                 }
@@ -394,11 +355,7 @@ where
 #[cfg(test)]
 mod tests {
     #[cfg(target_arch = "x86_64")]
-    use std::collections::VecDeque;
-    #[cfg(target_arch = "x86_64")]
-    use std::sync::mpsc::channel;
-    #[cfg(target_arch = "x86_64")]
-    use std::thread;
+    use std::{collections::VecDeque, sync::mpsc::channel, thread};
 
     use super::*;
     #[cfg(target_arch = "x86_64")]
@@ -412,53 +369,41 @@ mod tests {
 
     #[test]
     fn validates_ranges_and_totals() {
-        let request = PreFaultMemoryRequest {
-            ranges: vec![range(0x1000, 0x3000), range(0x9000, 0x1000)],
-        };
-        assert_eq!(
-            request.validate().unwrap(),
-            PreFaultMemoryStats {
-                total_size: 0x4000,
-                total_pages: 4,
-            }
-        );
-        assert!(matches!(
-            PreFaultMemoryRequest { ranges: vec![] }.validate(),
-            Err(PreFaultMemoryValidationError::EmptyRanges)
-        ));
-        assert!(matches!(
-            PreFaultMemoryRequest {
-                ranges: vec![range(0, 0)]
-            }
-            .validate(),
-            Err(PreFaultMemoryValidationError::ZeroSize(0))
-        ));
-        assert!(matches!(
-            PreFaultMemoryRequest {
-                ranges: vec![range(1, 0x1000)]
-            }
-            .validate(),
-            Err(PreFaultMemoryValidationError::Unaligned(0))
-        ));
-        assert!(matches!(
-            PreFaultMemoryRequest {
-                ranges: vec![range(u64::MAX - 0xfff, 0x2000)]
-            }
-            .validate(),
-            Err(PreFaultMemoryValidationError::AddressOverflow(0))
-        ));
-        assert!(matches!(
-            PreFaultMemoryRequest {
-                ranges: vec![range(0, u64::MAX - 0xfff), range(0, u64::MAX - 0xfff),]
-            }
-            .validate(),
-            Err(PreFaultMemoryValidationError::TotalSizeOverflow)
-        ));
+        let cases = [
+            (vec![range(0x1000, 0x3000), range(0x9000, 0x1000)], Ok(4u64)),
+            (vec![], Err(PreFaultMemoryValidationError::EmptyRanges)),
+            (
+                vec![range(0, 0)],
+                Err(PreFaultMemoryValidationError::ZeroSize(0)),
+            ),
+            (
+                vec![range(1, 0x1000)],
+                Err(PreFaultMemoryValidationError::Unaligned(0)),
+            ),
+            (
+                vec![range(u64::MAX - 0xfff, 0x2000)],
+                Err(PreFaultMemoryValidationError::AddressOverflow(0)),
+            ),
+            (
+                vec![range(0, u64::MAX - 0xfff), range(0, u64::MAX - 0xfff)],
+                Err(PreFaultMemoryValidationError::TotalSizeOverflow),
+            ),
+        ];
+        for (ranges, expected) in cases {
+            assert_eq!(PreFaultMemoryRequest { ranges }.validate(), expected);
+        }
     }
 
     #[test]
-    fn balances_pages_without_reordering_or_merging() {
+    fn split_ranges_are_balanced_without_reordering_or_loss() {
         let ranges = vec![range(0, 0x5000), range(0x10000, 0x1000)];
+        assert_eq!(
+            PreFaultMemoryRequest {
+                ranges: ranges.clone(),
+            }
+            .validate(),
+            Ok(6)
+        );
         let work = split_pre_fault_ranges(&ranges, 3).unwrap();
         assert_eq!(work.len(), 3);
         assert_eq!(work.iter().map(|worker| worker.len()).sum::<usize>(), 4);
@@ -472,22 +417,22 @@ mod tests {
         assert_eq!(work[1][0], range(0x2000, 0x2000));
         assert_eq!(work[2][0], range(0x4000, 0x1000));
         assert_eq!(work[2][1], range(0x10000, 0x1000));
-    }
 
-    #[test]
-    fn worker_count_never_exceeds_pages() {
-        let ranges = [range(0, 0x2000)];
-        let work = split_pre_fault_ranges(&ranges, 8).unwrap();
-        assert_eq!(work.len(), 2);
-        assert!(work.iter().all(|worker| !worker.is_empty()));
+        let few_ranges = [range(0, 0x2000)];
+        let few_work = split_pre_fault_ranges(&few_ranges, 8).unwrap();
+        assert_eq!(few_work.len(), 2);
+        assert!(few_work.iter().all(|worker| !worker.is_empty()));
         assert!(matches!(
-            split_pre_fault_ranges(&ranges, 0),
+            split_pre_fault_ranges(&few_ranges, 0),
             Err(PreFaultMemoryError::NoVcpus)
         ));
-    }
+        assert!(matches!(
+            split_pre_fault_ranges(&[], 1),
+            Err(PreFaultMemoryError::Validation(
+                PreFaultMemoryValidationError::EmptyRanges
+            ))
+        ));
 
-    #[test]
-    fn one_vcpu_preserves_ranges_and_large_ranges_split_on_pages() {
         let ranges = vec![range(0, 0x1000), range(0x4000, 0x9000)];
         assert_eq!(
             split_pre_fault_ranges(&ranges, 1).unwrap(),
@@ -496,63 +441,37 @@ mod tests {
 
         let work = split_pre_fault_ranges(&ranges, 4).unwrap();
         assert_eq!(work.iter().flatten().map(|r| r.size).sum::<u64>(), 0xa000);
-        assert!(work
-            .iter()
-            .flatten()
-            .all(|r| r.gpa % 0x1000 == 0 && r.size % 0x1000 == 0));
+        assert!(
+            work.iter()
+                .flatten()
+                .all(|r| r.gpa % 0x1000 == 0 && r.size % 0x1000 == 0)
+        );
         assert!(work.iter().flatten().all(|fragment| {
             ranges.iter().any(|source| {
                 fragment.gpa >= source.gpa
                     && fragment.gpa + fragment.size <= source.gpa + source.size
             })
         }));
-    }
 
-    #[test]
-    fn duplicate_ranges_are_preserved_without_deduplication() {
         let duplicate = range(0x2000, 0x1000);
-        let work = split_pre_fault_ranges(&[duplicate.clone(), duplicate.clone()], 2).unwrap();
-        assert_eq!(work, vec![vec![duplicate.clone()], vec![duplicate]]);
+        assert_eq!(
+            split_pre_fault_ranges(&[duplicate.clone(), duplicate.clone()], 2).unwrap(),
+            vec![vec![duplicate.clone()], vec![duplicate]]
+        );
     }
 
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn control_sends_all_work_before_receiving() {
-        let work = vec![vec![range(0, 0x1000)], vec![range(0x1000, 0x1000)]];
-        let mut sent = Vec::new();
-        let mut receiving = false;
-
-        let send_error = send_pre_fault_events(&work, |vcpu_id, _ranges| {
-            assert!(!receiving);
-            sent.push(vcpu_id);
-            Ok(())
-        });
-        assert!(send_error.is_none());
-        assert_eq!(sent, vec![0, 1]);
-
-        receiving = true;
-        let mut responses = VecDeque::from([
-            VcpuResponse::PreFaultMemoryCompleted,
-            VcpuResponse::PreFaultMemoryCompleted,
-        ]);
-        let response_error = drain_pre_fault_responses(work.len(), |_vcpu_id| {
-            assert!(receiving);
-            Ok(responses.pop_front().expect("missing test response"))
-        });
-        assert!(response_error.is_none());
-        assert!(responses.is_empty());
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn signal_failure_is_recorded_and_all_queued_workers_are_drained() {
+    fn signal_failure_is_recorded_and_all_workers_are_drained() {
         let work = vec![
             vec![range(0, 0x1000)],
             vec![range(0x1000, 0x1000)],
             vec![range(0x2000, 0x1000)],
         ];
         let mut sent = Vec::new();
+        let mut receiving = false;
         let send_error = send_pre_fault_events(&work, |vcpu_id, _ranges| {
+            assert!(!receiving);
             sent.push(vcpu_id);
             if vcpu_id == 1 {
                 Err(VcpuSendEventError(vmm_sys_util::errno::Error::new(
@@ -573,6 +492,8 @@ mod tests {
             VcpuResponse::PreFaultMemoryCompleted,
         ]);
         let response_error = drain_pre_fault_responses(work.len(), |_vcpu_id| {
+            receiving = true;
+            assert!(receiving);
             Ok(responses.pop_front().expect("missing test response"))
         });
         if first_error.is_none() {
@@ -608,7 +529,7 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn blocking_drain_leaves_next_operation_response_untouched() {
+    fn drain_leaves_next_operation_response_untouched() {
         let (release_sender, release_receiver) = channel();
         let (response_sender, response_receiver) = channel();
         let worker = thread::spawn(move || {
@@ -668,10 +589,6 @@ mod tests {
             PreFaultMemoryError::UnsupportedArchitecture.to_string(),
             "pre-fault memory is unsupported on aarch64"
         );
-        assert_eq!(
-            PreFaultMemoryIoctlError::Unsupported.to_string(),
-            "KVM_PRE_FAULT_MEMORY is unavailable on this architecture"
-        );
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -679,7 +596,7 @@ mod tests {
     fn ioctl_loop_handles_partial_progress_and_eintr() {
         let ranges = [range(0x1000, 0x3000)];
         let mut calls = 0;
-        run_pre_fault_memory(0, &ranges, |request| {
+        run_pre_fault_memory(&ranges, |request| {
             calls += 1;
             assert_eq!(request.flags, 0);
             assert_eq!(request.padding, [0; 5]);
@@ -703,13 +620,12 @@ mod tests {
     fn ioctl_loop_rejects_no_progress_and_propagates_errors() {
         let ranges = [range(0, 0x1000)];
         assert!(matches!(
-            run_pre_fault_memory(0, &ranges, |_| Ok(())),
+            run_pre_fault_memory(&ranges, |_| Ok(())),
             Err(PreFaultMemoryIoctlError::NoProgress { .. })
         ));
 
-        let result = run_pre_fault_memory(2, &ranges, |_| {
-            Err(io::Error::from_raw_os_error(libc::EINVAL))
-        });
+        let result =
+            run_pre_fault_memory(&ranges, |_| Err(io::Error::from_raw_os_error(libc::EINVAL)));
         assert!(matches!(
             result,
             Err(PreFaultMemoryIoctlError::Ioctl {

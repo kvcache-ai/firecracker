@@ -438,6 +438,21 @@ pub mod tests {
         format!("{}\r\n", req_no_body,)
     }
 
+    fn parse_http_request(
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+    ) -> Result<ParsedRequest, RequestError> {
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        sender
+            .write_all(http_request(method, path, body).as_bytes())
+            .unwrap();
+        let mut connection = HttpConnection::new(receiver);
+        connection.try_read().unwrap();
+        let request = connection.pop_parsed_request().unwrap();
+        ParsedRequest::try_from(&request)
+    }
+
     #[test]
     fn test_missing_slash() {
         let (mut sender, receiver) = UnixStream::pair().unwrap();
@@ -501,15 +516,10 @@ pub mod tests {
     #[test]
     fn test_put_pre_fault_memory_route() {
         let body = r#"{"ranges":[{"gpa":4096,"size":16384}]}"#;
-        let (mut sender, receiver) = UnixStream::pair().unwrap();
-        let mut connection = HttpConnection::new(receiver);
-        sender
-            .write_all(http_request("PUT", "/vm/pre-fault-memory", Some(body)).as_bytes())
-            .unwrap();
-        connection.try_read().unwrap();
-        let req = connection.pop_parsed_request().unwrap();
         assert_eq!(
-            vmm_action_from_request(ParsedRequest::try_from(&req).unwrap()),
+            vmm_action_from_request(
+                parse_http_request("PUT", "/vm/pre-fault-memory", Some(body)).unwrap()
+            ),
             VmmAction::PreFaultMemory(vmm::vstate::prefault::PreFaultMemoryRequest {
                 ranges: vec![vmm::vstate::prefault::PreFaultMemoryRange {
                     gpa: 4096,
@@ -520,7 +530,7 @@ pub mod tests {
     }
 
     #[test]
-    fn test_pre_fault_memory_route_rejects_empty_wrong_method_and_extra_path() {
+    fn test_pre_fault_memory_route_rejects_invalid_request() {
         for (method, path, body) in [
             ("PUT", "/vm/pre-fault-memory", None),
             ("GET", "/vm/pre-fault-memory", None),
@@ -530,15 +540,14 @@ pub mod tests {
                 Some(r#"{"ranges":[{"gpa":4096,"size":4096}]}"#),
             ),
         ] {
-            let (mut sender, receiver) = UnixStream::pair().unwrap();
-            let mut connection = HttpConnection::new(receiver);
-            sender
-                .write_all(http_request(method, path, body).as_bytes())
-                .unwrap();
-            connection.try_read().unwrap();
-            let req = connection.pop_parsed_request().unwrap();
-            assert!(ParsedRequest::try_from(&req).is_err(), "{method} {path}");
+            assert!(
+                parse_http_request(method, path, body).is_err(),
+                "{method} {path}"
+            );
         }
+
+        let body = r#"{"ranges":[{"gpa":4096,"size":4096,"extra":true}]}"#;
+        parse_http_request("PUT", "/vm/pre-fault-memory", Some(body)).unwrap_err();
     }
 
     #[test]
