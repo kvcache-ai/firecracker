@@ -25,6 +25,7 @@ use super::request::metrics::parse_put_metrics;
 use super::request::mmds::{parse_get_mmds, parse_patch_mmds, parse_put_mmds};
 use super::request::net::{parse_patch_net, parse_put_net};
 use super::request::pmem::parse_put_pmem;
+use super::request::prefault::parse_put_pre_fault_memory;
 use super::request::snapshot::{parse_patch_vm_state, parse_put_snapshot};
 use super::request::version::parse_get_version;
 use super::request::vsock::parse_put_vsock;
@@ -112,6 +113,12 @@ impl TryFrom<&Request> for ParsedRequest {
             (Method::Put, "serial", Some(body)) => parse_put_serial(body),
             (Method::Put, "machine-config", Some(body)) => parse_put_machine_config(body),
             (Method::Put, "metrics", Some(body)) => parse_put_metrics(body),
+            (Method::Put, "vm", Some(body))
+                if path_tokens.next() == Some("pre-fault-memory")
+                    && path_tokens.next().is_none() =>
+            {
+                parse_put_pre_fault_memory(body)
+            }
             (Method::Put, "mmds", Some(body)) => parse_put_mmds(body, path_tokens.next()),
             (Method::Put, "network-interfaces", Some(body)) => {
                 parse_put_net(body, path_tokens.next())
@@ -489,6 +496,66 @@ pub mod tests {
             &parsed_request,
             Err(RequestError::Generic(StatusCode::BadRequest, s)) if s == "Empty PUT request.",
         ));
+    }
+
+    #[test]
+    fn test_put_pre_fault_memory_route() {
+        let body = r#"{"ranges":[{"gpa":4096,"size":16384}]}"#;
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        let mut connection = HttpConnection::new(receiver);
+        sender
+            .write_all(http_request("PUT", "/vm/pre-fault-memory", Some(body)).as_bytes())
+            .unwrap();
+        connection.try_read().unwrap();
+        let req = connection.pop_parsed_request().unwrap();
+        assert_eq!(
+            vmm_action_from_request(ParsedRequest::try_from(&req).unwrap()),
+            VmmAction::PreFaultMemory(vmm::vstate::prefault::PreFaultMemoryRequest {
+                ranges: vec![vmm::vstate::prefault::PreFaultMemoryRange {
+                    gpa: 4096,
+                    size: 16384,
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn test_pre_fault_memory_route_rejects_empty_wrong_method_and_extra_path() {
+        for (method, path, body) in [
+            ("PUT", "/vm/pre-fault-memory", None),
+            ("GET", "/vm/pre-fault-memory", None),
+            (
+                "PUT",
+                "/vm/pre-fault-memory/extra",
+                Some(r#"{"ranges":[{"gpa":4096,"size":4096}]}"#),
+            ),
+        ] {
+            let (mut sender, receiver) = UnixStream::pair().unwrap();
+            let mut connection = HttpConnection::new(receiver);
+            sender
+                .write_all(http_request(method, path, body).as_bytes())
+                .unwrap();
+            connection.try_read().unwrap();
+            let req = connection.pop_parsed_request().unwrap();
+            assert!(ParsedRequest::try_from(&req).is_err(), "{method} {path}");
+        }
+    }
+
+    #[test]
+    fn test_pre_fault_memory_errors_are_bad_request() {
+        for error in [
+            vmm::vstate::prefault::PreFaultMemoryError::CapabilityMissing,
+            vmm::vstate::prefault::PreFaultMemoryError::VmNotPaused(
+                vmm::vmm_config::instance_info::VmState::Running,
+            ),
+            vmm::vstate::prefault::PreFaultMemoryError::Validation(
+                vmm::vstate::prefault::PreFaultMemoryValidationError::EmptyRanges,
+            ),
+        ] {
+            let response =
+                ParsedRequest::convert_to_response(&Err(VmmActionError::PreFaultMemory(error)));
+            assert_eq!(response.status(), StatusCode::BadRequest);
+        }
     }
 
     #[test]

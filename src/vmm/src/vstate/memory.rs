@@ -719,6 +719,9 @@ where
     where
         F: FnMut(&GuestRegionMmapExt, MemoryRegionAddress, usize) -> Result<(), GuestMemoryError>;
 
+    /// Returns whether a range is fully covered by plugged KVM memory slots.
+    fn is_range_fully_plugged(&self, addr: GuestAddress, range_len: u64) -> bool;
+
     /// Discards a memory range, freeing up memory pages
     fn discard_range(&self, addr: GuestAddress, range_len: usize) -> Result<(), GuestMemoryError>;
 }
@@ -924,6 +927,41 @@ impl GuestMemoryExtension for GuestMemoryMmap {
         Err(GuestMemoryError::InvalidGuestAddress(cur))
     }
 
+    fn is_range_fully_plugged(&self, addr: GuestAddress, range_len: u64) -> bool {
+        if range_len == 0 {
+            return false;
+        }
+        let Some(range_end) = addr.checked_add(range_len) else {
+            return false;
+        };
+
+        let mut current = addr;
+        while current < range_end {
+            let next_slot_end = self
+                .iter()
+                .flat_map(|region| region.slots())
+                .filter(|(_, plugged)| *plugged)
+                .filter_map(|(slot, _)| {
+                    let slot_end = slot
+                        .guest_addr
+                        .checked_add(u64::try_from(slot.slice.len()).ok()?)?;
+                    (slot.guest_addr <= current && current < slot_end).then_some(slot_end)
+                })
+                .min();
+
+            let Some(next_slot_end) = next_slot_end else {
+                return false;
+            };
+            current = if next_slot_end < range_end {
+                next_slot_end
+            } else {
+                range_end
+            };
+        }
+
+        true
+    }
+
     fn discard_range(&self, addr: GuestAddress, range_len: usize) -> Result<(), GuestMemoryError> {
         self.try_for_each_region_in_range(addr, range_len, |region, start, len| {
             region.discard_range(start, len)
@@ -1015,6 +1053,34 @@ mod tests {
                 assert_eq!(region.bitmap().is_some(), dirty_page_tracking);
             });
         }
+    }
+
+    #[test]
+    fn test_range_fully_plugged_rejects_holes_and_unplugged_slots() {
+        let regions = anonymous(
+            [(GuestAddress(0), 0x2000), (GuestAddress(0x4000), 0x2000)].into_iter(),
+            false,
+            HugePageConfig::None,
+        )
+        .unwrap();
+        let guest_memory = into_region_ext(regions);
+        assert!(guest_memory.is_range_fully_plugged(GuestAddress(0), 0x2000));
+        assert!(!guest_memory.is_range_fully_plugged(GuestAddress(0x1000), 0x4000));
+        assert!(guest_memory.is_range_fully_plugged(GuestAddress(0x4000), 0x2000));
+
+        let hotplug_region = anonymous(
+            [(GuestAddress(0x8000), 0x2000)].into_iter(),
+            false,
+            HugePageConfig::None,
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        let hotplug_memory = GuestMemoryMmap::from_regions(vec![
+            GuestRegionMmapExt::hotpluggable_from_mmap_region(hotplug_region, 0, 0x1000),
+        ])
+        .unwrap();
+        assert!(!hotplug_memory.is_range_fully_plugged(GuestAddress(0x8000), 0x1000));
     }
 
     #[test]
