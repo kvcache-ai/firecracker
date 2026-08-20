@@ -153,6 +153,7 @@ use crate::rate_limiter::BucketUpdate;
 use crate::resources::VmmConfig;
 use crate::rpc_interface::VmmActionError;
 use crate::vmm_config::HotplugDeviceConfig;
+use crate::utils::u64_to_usize;
 use crate::vmm_config::balloon::BalloonDeviceConfig;
 use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::entropy::EntropyDeviceConfig;
@@ -165,6 +166,7 @@ use crate::vmm_config::vsock::VsockDeviceConfig;
 pub use crate::vstate::kvm::Kvm;
 use crate::vstate::memory::{
     GuestAddress, GuestMemory, GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion,
+    GuestRegionType,
 };
 use crate::vstate::prefault::{PreFaultMemoryError, PreFaultMemoryRequest};
 #[cfg(target_arch = "x86_64")]
@@ -509,10 +511,23 @@ impl Vmm {
         }
 
         for (index, range) in request.ranges.iter().enumerate() {
-            if !kvm_vm
-                .guest_memory()
-                .is_range_fully_plugged(GuestAddress(range.gpa), range.size)
-            {
+            // Only allow pre-faulting of ordinary DRAM. A range that touches a hole or a
+            // `Hotpluggable` (virtio-mem) region is rejected: a single active virtio-mem block
+            // can mark its whole KVM slot as plugged without every byte belonging to the guest,
+            // so plugged-slot coverage is not a safe proxy for guest-owned memory here.
+            let guest_memory = kvm_vm.guest_memory();
+            let mut all_dram = true;
+            let covered = guest_memory
+                .try_for_each_region_in_range(
+                    GuestAddress(range.gpa),
+                    u64_to_usize(range.size),
+                    |region, _, _| {
+                        all_dram &= region.region_type == GuestRegionType::Dram;
+                        Ok(())
+                    },
+                )
+                .is_ok();
+            if !covered || !all_dram {
                 return Err(PreFaultMemoryError::NotGuestRam(index));
             }
         }

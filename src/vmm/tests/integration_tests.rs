@@ -701,3 +701,51 @@ fn test_prefault_memory_multi_vcpu_preserves_split_bytes_and_control_channel() {
     assert_pre_fault_recovery(&vmm);
     vmm.lock().unwrap().stop(FcExitCode::Ok);
 }
+
+#[cfg(target_arch = "x86_64")]
+fn hotplug_vmm_no_boot(kernel_image: Option<&str>) -> (Arc<Mutex<Vmm>>, EventManager) {
+    // A no-boot (Paused) VMM with virtio-mem hotpluggable memory enabled, so its guest memory
+    // contains a Hotpluggable region alongside the DRAM region.
+    create_vmm(kernel_image, false, false, false, true)
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn test_prefault_memory_rejects_hotpluggable_region() {
+    use vm_memory::{GuestMemory, GuestMemoryRegion};
+
+    use vmm::vstate::memory::GuestRegionType;
+
+    // Pre-fault must reject ranges that fall inside a Hotpluggable (virtio-mem) region even when the
+    // backing KVM slot exists: a single active virtio-mem block can mark the whole slot as plugged
+    // without every byte belonging to the guest. Resolve the hotpluggable region's start address
+    // dynamically so the test does not depend on the host allocator's layout.
+    let (vmm, _) = hotplug_vmm_no_boot(Some(NOISY_KERNEL_IMAGE));
+    let mut controller = RuntimeApiController::new(vmm.clone());
+
+    let hotplug_start = {
+        let locked = vmm.lock().unwrap();
+        let guest_memory = locked.vm.guest_memory();
+        guest_memory
+            .iter()
+            .find(|region| region.region_type == GuestRegionType::Hotpluggable)
+            .map(|region| region.start_addr().0)
+            .expect("hotpluggable region must exist when memory hotplug is enabled")
+    };
+    assert_eq!(hotplug_start % 0x1000, 0);
+
+    let error = controller
+        .handle_request(pre_fault_action(hotplug_start, 0x1000))
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            VmmActionError::PreFaultMemory(PreFaultMemoryError::NotGuestRam(0))
+        ),
+        "pre-fault into a hotpluggable region must be rejected with NotGuestRam(0), got {error:?}"
+    );
+
+    // The rejected request sent no work; the control channel must remain usable.
+    assert_pre_fault_recovery(&vmm);
+    vmm.lock().unwrap().stop(FcExitCode::Ok);
+}
