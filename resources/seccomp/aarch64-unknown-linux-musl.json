@@ -466,6 +466,25 @@
                 ]
             },
             {
+                "syscall": "ioctl",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 44547,
+                        "comment": "KVM_CHECK_EXTENSION"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 236,
+                        "comment": "KVM_CAP_PRE_FAULT_MEMORY"
+                    }
+                ]
+            },
+            {
                 "syscall": "sched_yield",
                 "comment": "Used by the rust standard library in std::sync::mpmc. Firecracker uses mpsc channels from this module for inter-thread communication"
             },
@@ -981,6 +1000,18 @@
                         "op": "eq",
                         "val": 44672,
                         "comment": "KVM_RUN"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 3225464533,
+                        "comment": "KVM_PRE_FAULT_MEMORY"
                     }
                 ]
             },
