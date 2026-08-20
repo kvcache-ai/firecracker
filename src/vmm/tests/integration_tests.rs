@@ -8,9 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-#[cfg(target_arch = "x86_64")]
 use kvm_bindings::KVM_CAP_PRE_FAULT_MEMORY;
-#[cfg(target_arch = "x86_64")]
 use kvm_ioctls::Kvm;
 use vmm::builder::build_and_boot_microvm;
 #[cfg(target_arch = "x86_64")]
@@ -38,10 +36,8 @@ use vmm::vmm_config::snapshot::{
     CreateSnapshotParams, LoadSnapshotParams, MemBackendConfig, MemBackendType, SnapshotType,
 };
 use vmm::vmm_config::vsock::VsockDeviceConfig;
-#[cfg(target_arch = "x86_64")]
 use vmm::vstate::prefault::PreFaultMemoryIoctlError;
 use vmm::vstate::prefault::{PreFaultMemoryError, PreFaultMemoryRange, PreFaultMemoryRequest};
-#[cfg(target_arch = "x86_64")]
 use vmm::vstate::vcpu::VcpuError;
 use vmm::{DumpCpuConfigError, EventManager, FcExitCode, Vmm};
 use vmm_sys_util::tempfile::TempFile;
@@ -537,7 +533,6 @@ fn assert_pre_fault_recovery(vmm: &Arc<Mutex<Vmm>>) {
     vmm.lock().unwrap().save_state(&vm_info).unwrap();
 }
 
-#[cfg(target_arch = "x86_64")]
 fn assert_pre_fault_supported_or_host_unsupported(result: Result<VmmData, VmmActionError>) {
     let capability = Kvm::new()
         .expect("failed to open KVM while checking KVM_CAP_PRE_FAULT_MEMORY")
@@ -569,19 +564,6 @@ fn assert_pre_fault_supported_or_host_unsupported(result: Result<VmmData, VmmAct
             "KVM_CAP_PRE_FAULT_MEMORY=0, expected CapabilityMissing, got {result:?}"
         );
     }
-}
-
-#[cfg(target_arch = "aarch64")]
-fn assert_pre_fault_supported_or_host_unsupported(result: Result<VmmData, VmmActionError>) {
-    assert!(
-        matches!(
-            &result,
-            Err(VmmActionError::PreFaultMemory(
-                PreFaultMemoryError::UnsupportedArchitecture
-            ))
-        ),
-        "aarch64 pre-fault must return UnsupportedArchitecture, got {result:?}"
-    );
 }
 
 #[test]

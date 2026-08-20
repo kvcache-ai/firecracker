@@ -125,7 +125,6 @@ use std::time::Duration;
 
 use device_manager::DeviceManager;
 use event_manager::{EventManager as BaseEventManager, EventOps, Events, MutEventSubscriber};
-#[cfg(target_arch = "x86_64")]
 use kvm_bindings::KVM_CAP_PRE_FAULT_MEMORY;
 use seccomp::BpfProgram;
 use snapshot::Persist;
@@ -170,7 +169,6 @@ use crate::vstate::memory::{
     GuestRegionType,
 };
 use crate::vstate::prefault::{PreFaultMemoryError, PreFaultMemoryRequest};
-#[cfg(target_arch = "x86_64")]
 use crate::vstate::prefault::{
     drain_pre_fault_responses, send_pre_fault_events, split_pre_fault_ranges,
 };
@@ -595,23 +593,6 @@ impl Vmm {
             }
         }
 
-        #[cfg(target_arch = "x86_64")]
-        {
-            self.pre_fault_memory_x86(request)
-        }
-
-        #[cfg(target_arch = "aarch64")]
-        {
-            let _ = request;
-            Err(PreFaultMemoryError::UnsupportedArchitecture)
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    fn pre_fault_memory_x86(
-        &mut self,
-        request: PreFaultMemoryRequest,
-    ) -> Result<(), PreFaultMemoryError> {
         if self
             .kvm
             .fd

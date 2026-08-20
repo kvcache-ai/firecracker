@@ -28,7 +28,6 @@ use crate::seccomp::{BpfProgram, BpfProgramRef};
 use crate::utils::signal::{Killable, register_signal_handler, sigrtmin};
 use crate::utils::sm::StateMachine;
 use crate::vstate::bus::Bus;
-#[cfg(target_arch = "x86_64")]
 use crate::vstate::prefault::pre_fault_memory;
 use crate::vstate::prefault::{PreFaultMemoryIoctlError, PreFaultMemoryRange};
 use crate::vstate::vm::Vm;
@@ -364,7 +363,6 @@ impl Vcpu {
 
                 StateMachine::next(Self::paused)
             }
-            #[cfg(target_arch = "x86_64")]
             Ok(VcpuEvent::PreFaultMemory(ranges)) => {
                 pre_fault_memory(&self.kvm_vcpu.fd, &ranges)
                     .map(|()| {
@@ -378,15 +376,6 @@ impl Vcpu {
                             .expect("vcpu channel unexpectedly closed");
                     });
 
-                StateMachine::next(Self::paused)
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            Ok(VcpuEvent::PreFaultMemory(_)) => {
-                self.response_sender
-                    .send(VcpuResponse::NotAllowed(String::from(
-                        "pre-fault memory is unsupported on this architecture",
-                    )))
-                    .expect("vcpu channel unexpectedly closed");
                 StateMachine::next(Self::paused)
             }
             Ok(VcpuEvent::Finish) => StateMachine::finish(),
