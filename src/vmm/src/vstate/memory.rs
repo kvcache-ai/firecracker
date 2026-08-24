@@ -6,7 +6,7 @@
 // found in the THIRD-PARTY file.
 
 use std::fs::File;
-use std::io::SeekFrom;
+use std::io::{Seek, SeekFrom};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 
@@ -73,8 +73,6 @@ pub enum MemoryError {
     MemfdSetLen(std::io::Error),
     /// Total sum of memory regions exceeds largest possible file offset
     OffsetTooLarge,
-    /// Cannot retrieve snapshot file metadata: {0}
-    FileMetadata(std::io::Error),
     /// Memory region has zero slots
     ZeroSlots,
     /// Memory region of {region_size} bytes is not evenly divisible into {slot_count} slots
@@ -658,7 +656,7 @@ pub fn anonymous(
 /// Creates a GuestMemoryMmap given a `file` containing the data
 /// and a `state` containing mapping information.
 pub fn snapshot_file(
-    file: File,
+    mut file: File,
     regions: impl Iterator<Item = (GuestAddress, usize)>,
     track_dirty_pages: bool,
 ) -> Result<Vec<GuestRegionMmap>, MemoryError> {
@@ -667,7 +665,9 @@ pub fn snapshot_file(
         .iter()
         .try_fold(0u64, |acc, (_, size)| acc.checked_add(*size as u64))
         .ok_or(MemoryError::OffsetTooLarge)?;
-    let file_size = file.metadata().map_err(MemoryError::FileMetadata)?.len();
+    // lseek correctly reports the capacity of block-device snapshot backends, for which fstat
+    // may report st_size as zero, while preserving regular-file behaviour.
+    let file_size = file.seek(SeekFrom::End(0)).map_err(MemoryError::SeekError)?;
 
     // ensure we do not mmap beyond EOF. The kernel would allow that but a SIGBUS is triggered
     // on an attempted access to a page of the buffer that lies beyond the end of the mapped file.

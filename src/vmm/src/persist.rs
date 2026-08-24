@@ -180,13 +180,15 @@ pub fn create_snapshot(
             "snapshot requires KVM".into(),
         ))
     })?;
-    kvm_vm.snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type)?;
+    if let Some(mem_file_path) = &params.mem_file_path {
+        kvm_vm.snapshot_memory_to_file(mem_file_path, params.snapshot_type)?;
 
-    // We need to mark queues as dirty again for all activated devices. The reason we
-    // do it here is that we don't mark pages as dirty during runtime
-    // for queue objects.
-    vmm.device_manager
-        .mark_virtio_queue_memory_dirty(kvm_vm.guest_memory());
+        // We need to mark queues as dirty again for all activated devices. The reason we
+        // do it here is that we don't mark pages as dirty during runtime
+        // for queue objects.
+        vmm.device_manager
+            .mark_virtio_queue_memory_dirty(kvm_vm.guest_memory());
+    }
 
     Ok(())
 }
