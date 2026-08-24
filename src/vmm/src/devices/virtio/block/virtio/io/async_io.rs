@@ -163,7 +163,11 @@ impl AsyncFileEngine {
 
     /// Returns true if the guest address requires a bounce buffer for O_DIRECT.
     fn needs_bounce_buf(&self, addr: GuestAddress) -> bool {
-        self.direct && !(addr.0 as usize).is_multiple_of(DIRECT_IO_ALIGN)
+        self.direct
+            && match usize::try_from(addr.0) {
+                Ok(addr) => !addr.is_multiple_of(DIRECT_IO_ALIGN),
+                Err(_) => true,
+            }
     }
 
     pub fn push_read(
