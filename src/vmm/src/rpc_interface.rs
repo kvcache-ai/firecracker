@@ -1319,7 +1319,6 @@ mod tests {
                 iface_id: String::new(),
                 rx_rate_limiter: None,
                 tx_rate_limiter: None,
-                mtu: None,
             },
         )));
         check_unsupported(preboot_request(VmmAction::CreateSnapshot(
@@ -1435,6 +1434,7 @@ mod tests {
                 guest_mac: None,
                 rx_rate_limiter: None,
                 tx_rate_limiter: None,
+                mtu: None,
             },
         )));
         check_unsupported(runtime_request(VmmAction::SetVsockDevice(
