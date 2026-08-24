@@ -26,7 +26,6 @@ use crate::persist::{CreateSnapshotError, RestoreFromSnapshotError, VmInfo};
 use crate::resources::VmmConfig;
 use crate::seccomp::BpfThreadMap;
 use crate::vmm_config::HotplugDeviceConfig;
-use crate::vstate::memory::GuestMemory;
 use crate::vmm_config::balloon::{
     BalloonConfigError, BalloonDeviceConfig, BalloonStats, BalloonUpdateConfig,
     BalloonUpdateStatsConfig,
@@ -1281,14 +1280,12 @@ mod tests {
         check_unsupported(preboot_request(VmmAction::GetBalloonStats));
         check_unsupported(preboot_request(VmmAction::GetDirtyMemoryRanges));
         check_unsupported(preboot_request(VmmAction::GetGuestMemoryRegions));
-        let pre_fault_result = preboot_request(VmmAction::PreFaultMemory(
-            PreFaultMemoryRequest {
-                ranges: vec![crate::vstate::prefault::PreFaultMemoryRange {
-                    gpa: 0,
-                    size: 0x1000,
-                }],
-            },
-        ));
+        let pre_fault_result = preboot_request(VmmAction::PreFaultMemory(PreFaultMemoryRequest {
+            ranges: vec![crate::vstate::prefault::PreFaultMemoryRange {
+                gpa: 0,
+                size: 0x1000,
+            }],
+        }));
         assert!(matches!(
             pre_fault_result,
             Err(VmmActionError::PreFaultMemory(

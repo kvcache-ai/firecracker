@@ -15,7 +15,9 @@ use crate::io_uring::operation::{Cqe, OpCode, Operation};
 use crate::io_uring::restriction::Restriction;
 use crate::io_uring::{IoUring, IoUringError};
 use crate::logger::log_dev_preview_warning;
-use crate::vstate::memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryExtension, GuestMemoryMmap};
+use crate::vstate::memory::{
+    Bytes, GuestAddress, GuestMemory, GuestMemoryExtension, GuestMemoryMmap,
+};
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum AsyncIoError {
@@ -84,11 +86,7 @@ impl WrappedRequest {
         }
     }
 
-    fn mark_dirty_mem_and_unwrap(
-        mut self,
-        mem: &GuestMemoryMmap,
-        count: u32,
-    ) -> PendingRequest {
+    fn mark_dirty_mem_and_unwrap(mut self, mem: &GuestMemoryMmap, count: u32) -> PendingRequest {
         if let Some(addr) = self.addr {
             // If there is a bounce buffer, this was a read: copy data to guest memory.
             if let Some(ref bounce) = self.bounce_buf {
@@ -181,7 +179,12 @@ impl AsyncFileEngine {
             // On completion, the data will be copied to guest memory in pop().
             let bounce = match AlignedBuf::new(count as usize, DIRECT_IO_ALIGN) {
                 Some(b) => b,
-                None => return Err(RequestError { req, error: AsyncIoError::BounceBufferAlloc }),
+                None => {
+                    return Err(RequestError {
+                        req,
+                        error: AsyncIoError::BounceBufferAlloc,
+                    });
+                }
             };
             let buf_ptr = bounce.as_ptr();
             let wrapped_user_data = WrappedRequest::new_with_bounce_buf(addr, req, bounce);
@@ -238,7 +241,12 @@ impl AsyncFileEngine {
             // Copy guest data into an aligned bounce buffer, then submit write from it.
             let mut bounce = match AlignedBuf::new(count as usize, DIRECT_IO_ALIGN) {
                 Some(b) => b,
-                None => return Err(RequestError { req, error: AsyncIoError::BounceBufferAlloc }),
+                None => {
+                    return Err(RequestError {
+                        req,
+                        error: AsyncIoError::BounceBufferAlloc,
+                    });
+                }
             };
             if let Err(err) = mem.read_slice(bounce.as_mut_slice(), addr) {
                 return Err(RequestError {

@@ -151,8 +151,8 @@ use crate::persist::{MicrovmState, MicrovmStateError, VmInfo};
 use crate::rate_limiter::BucketUpdate;
 use crate::resources::VmmConfig;
 use crate::rpc_interface::VmmActionError;
-use crate::vmm_config::HotplugDeviceConfig;
 use crate::utils::u64_to_usize;
+use crate::vmm_config::HotplugDeviceConfig;
 use crate::vmm_config::balloon::BalloonDeviceConfig;
 use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::entropy::EntropyDeviceConfig;
@@ -530,7 +530,8 @@ impl Vmm {
             }
         }
 
-        if kvm_vm.kvm()
+        if kvm_vm
+            .kvm()
             .fd
             .check_extension_raw(u64::from(KVM_CAP_PRE_FAULT_MEMORY))
             == 0

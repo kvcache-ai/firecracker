@@ -147,9 +147,9 @@ impl FileEngine {
 
     pub fn update_file_path(&mut self, file: File, direct: bool) -> Result<(), BlockIoError> {
         match self {
-            FileEngine::Async(engine) => {
-                engine.update_file(file, direct).map_err(BlockIoError::Async)?
-            }
+            FileEngine::Async(engine) => engine
+                .update_file(file, direct)
+                .map_err(BlockIoError::Async)?,
             FileEngine::Sync(engine) => engine.update_file(file, direct),
         };
 

@@ -556,7 +556,8 @@ impl VirtioBlock {
 
     /// Update the backing file and the config space of the block device.
     pub fn update_disk_image(&mut self, disk_image_path: String) -> Result<(), VirtioBlockError> {
-        self.disk.update(disk_image_path, self.read_only, self.direct)?;
+        self.disk
+            .update(disk_image_path, self.read_only, self.direct)?;
         self.config_space.capacity = self.disk.nsectors.to_le(); // virtio_block_config_space();
 
         // Kick the driver to pick up the changes. (But only if the device is already activated).
@@ -794,9 +795,13 @@ mod tests {
         f.as_file().set_len(size).unwrap();
 
         for engine in [FileEngineType::Sync, FileEngineType::Async] {
-            let disk_properties =
-                DiskProperties::new(String::from(f.as_path().to_str().unwrap()), true, engine, false)
-                    .unwrap();
+            let disk_properties = DiskProperties::new(
+                String::from(f.as_path().to_str().unwrap()),
+                true,
+                engine,
+                false,
+            )
+            .unwrap();
 
             assert_eq!(size, u64::from(SECTOR_SIZE) * num_sectors);
             assert_eq!(disk_properties.nsectors, num_sectors);

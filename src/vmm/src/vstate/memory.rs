@@ -667,7 +667,9 @@ pub fn snapshot_file(
         .ok_or(MemoryError::OffsetTooLarge)?;
     // lseek correctly reports the capacity of block-device snapshot backends, for which fstat
     // may report st_size as zero, while preserving regular-file behaviour.
-    let file_size = file.seek(SeekFrom::End(0)).map_err(MemoryError::SeekError)?;
+    let file_size = file
+        .seek(SeekFrom::End(0))
+        .map_err(MemoryError::SeekError)?;
 
     // ensure we do not mmap beyond EOF. The kernel would allow that but a SIGBUS is triggered
     // on an attempted access to a page of the buffer that lies beyond the end of the mapped file.
