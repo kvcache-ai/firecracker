@@ -1008,8 +1008,9 @@ impl RuntimeApiController {
     /// contiguous.
     fn get_guest_memory_regions(&self) -> Result<VmmData, VmmActionError> {
         let locked_vmm = self.vmm.lock().expect("Poisoned lock");
-        let guest_memory = locked_vmm.vm.guest_memory();
-        let huge_pages = self.vm_resources.machine_config.huge_pages;
+        let kvm_vm = locked_vmm.vm.as_kvm().expect("VMM must hold a KVM VM");
+        let guest_memory = kvm_vm.guest_memory();
+        let huge_pages = locked_vmm.machine_config.huge_pages;
         let mappings = build_uffd_mappings(guest_memory.iter(), huge_pages);
         Ok(VmmData::GuestMemoryRegions(mappings))
     }
@@ -1021,7 +1022,8 @@ impl RuntimeApiController {
     /// internal bitmap before this method returns.
     fn get_dirty_memory_ranges(&self) -> Result<VmmData, VmmActionError> {
         let locked_vmm = self.vmm.lock().expect("Poisoned lock");
-        let ranges = locked_vmm.vm.get_dirty_memory_ranges_preserve()?;
+        let kvm_vm = locked_vmm.vm.as_kvm().expect("VMM must hold a KVM VM");
+        let ranges = kvm_vm.get_dirty_memory_ranges_preserve()?;
         Ok(VmmData::DirtyMemoryRanges(ranges))
     }
 

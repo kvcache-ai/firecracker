@@ -125,7 +125,6 @@ use std::time::Duration;
 use device_manager::DeviceManager;
 use event_manager::{EventManager as BaseEventManager, EventOps, Events, MutEventSubscriber};
 use kvm_bindings::KVM_CAP_PRE_FAULT_MEMORY;
-use seccomp::BpfProgram;
 use snapshot::Persist;
 use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::terminal::Terminal;
@@ -539,7 +538,7 @@ impl Vmm {
             return Err(PreFaultMemoryError::CapabilityMissing);
         }
 
-        let handles = kvm_vm.vcpus_handles();
+        let mut handles = kvm_vm.vcpus_handles();
         let work = split_pre_fault_ranges(&request.ranges, handles.len())?;
 
         // Send every work queue before waiting for any response. This lets the kernel fault pages

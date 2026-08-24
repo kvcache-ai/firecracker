@@ -29,7 +29,6 @@ use crate::arch::{GSI_MSI_END, host_page_size};
 pub use crate::arch::{KvmVm, KvmVmError, VmState};
 use crate::logger::{debug, info};
 use crate::persist::CreateSnapshotError;
-use crate::utils::get_page_size;
 use crate::vmm_config::snapshot::SnapshotType;
 use crate::vstate::bus::Bus;
 use crate::vstate::interrupts::{InterruptError, MsixVector, MsixVectorConfig, MsixVectorGroup};
@@ -570,7 +569,7 @@ impl KvmVm {
     /// snapshot still sees the pages if the external consumer fails.
     pub fn get_dirty_memory_ranges_preserve(&self) -> Result<DirtyMemoryRanges, VmError> {
         let dirty_bitmap = self.get_dirty_bitmap()?;
-        let page_size = get_page_size().map_err(MemoryError::PageSize)?;
+        let page_size = host_page_size();
         self.guest_memory()
             .store_dirty_bitmap(&dirty_bitmap, page_size);
         self.guest_memory()
