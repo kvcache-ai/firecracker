@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.1-patch-v1]
+
+AgentENV downstream runtime, based on upstream Firecracker `v1.16.1`.
+
+### Added
+
+- `direct` drive option for opening a backing file with `O_DIRECT`.
+- Runtime `GET /vm/dirty-memory-ranges` API for querying dirty guest memory
+  ranges without first dumping a guest-memory snapshot.
+- Paused-only `PUT /vm/pre-fault-memory` API for caller-supplied guest-physical
+  ranges. It uses `KVM_PRE_FAULT_MEMORY` only when the host reports
+  `KVM_CAP_PRE_FAULT_MEMORY`.
+
+### Changed
+
+- Pre-fault availability is decided by the host KVM capability on every
+  architecture. Hosts without the capability receive the API's unsupported
+  response; the implementation does not hard-code aarch64 as unsupported.
+- Snapshot creation can omit the memory-file path when only VM state is needed.
+
 ## [1.16.1]
 
 ### Fixed
@@ -66,17 +86,6 @@ and this project adheres to
 ### Deprecated
 
 ### Removed
-
-### Added
-
-- [#XXXX](https://github.com/firecracker-microvm/firecracker/pull/XXXX): Add
-  runtime `GET /vm/dirty-memory-ranges` API for querying dirty guest memory
-  ranges without first dumping the guest memory snapshot to a file.
-- [#XXXX](https://github.com/firecracker-microvm/firecracker/pull/XXXX): Add
-  paused-only `PUT /vm/pre-fault-memory` for caller-supplied guest-physical
-  ranges. On x86_64 this uses `KVM_PRE_FAULT_MEMORY` when
-  `KVM_CAP_PRE_FAULT_MEMORY` is available; aarch64 reports unsupported. It does
-  not change default startup or snapshot-restore behavior.
 
 ### Fixed
 

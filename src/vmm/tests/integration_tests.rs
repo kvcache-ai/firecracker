@@ -605,7 +605,8 @@ fn test_prefault_memory_state_validation_recovery_and_repeated_calls() {
 
     let first_result = controller.handle_request(pre_fault_action(0, 0x1000), &mut event_manager);
     assert_pre_fault_supported_or_host_unsupported(first_result);
-    let second_result = controller.handle_request(pre_fault_action(0x1000, 0x1000), &mut event_manager);
+    let second_result =
+        controller.handle_request(pre_fault_action(0x1000, 0x1000), &mut event_manager);
     assert_pre_fault_supported_or_host_unsupported(second_result);
 
     // Rejected requests sent no work; verify that the VM remains usable. The repeated calls above
