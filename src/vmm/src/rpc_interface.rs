@@ -1106,6 +1106,7 @@ mod tests {
     use super::*;
     use crate::HTTP_MAX_PAYLOAD_SIZE;
     use crate::builder::tests::default_vmm;
+    use crate::devices::virtio::block::CacheType;
     use crate::mmds::data_store::MmdsVersion;
     use crate::seccomp::BpfThreadMap;
     use crate::vmm_config::snapshot::{MemBackendConfig, MemBackendType};
@@ -1318,6 +1319,7 @@ mod tests {
                 iface_id: String::new(),
                 rx_rate_limiter: None,
                 tx_rate_limiter: None,
+                mtu: None,
             },
         )));
         check_unsupported(preboot_request(VmmAction::CreateSnapshot(
