@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.15.1-patch-v2]
+
+### Added
+
+- Release the existing paused-only `PUT /vm/pre-fault-memory` API from PR #18.
+  On x86_64 with `KVM_CAP_PRE_FAULT_MEMORY`, it distributes validated,
+  page-aligned guest-physical ranges across the available vCPUs using
+  `KVM_PRE_FAULT_MEMORY`; aarch64 remains unsupported. This release does not
+  change startup, restore behavior, or the snapshot serialization/data format.
+
 ## [1.15.1]
 
 ### Added
