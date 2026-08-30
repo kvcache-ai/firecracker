@@ -5,6 +5,7 @@
 
 use std::io;
 use std::mem::size_of;
+use std::time::Instant;
 
 use kvm_bindings::kvm_pre_fault_memory;
 use kvm_ioctls::VcpuFd;
@@ -37,6 +38,67 @@ pub struct PreFaultMemoryRange {
 pub struct PreFaultMemoryRequest {
     /// Ranges to pre-fault, in the order supplied by the caller.
     pub ranges: Vec<PreFaultMemoryRange>,
+}
+
+/// Completion statistics for the work executed by one vCPU worker.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct PreFaultMemoryWorkerStats {
+    /// Zero-based vCPU worker index.
+    pub vcpu_id: u32,
+    /// Number of input ranges assigned to this worker.
+    pub range_count: u64,
+    /// Bytes assigned to this worker.
+    pub requested_bytes: u64,
+    /// Bytes for which the kernel reported forward progress.
+    pub completed_bytes: u64,
+    /// Bytes remaining when the worker completed. Successful work must be zero.
+    pub remaining_bytes: u64,
+    /// Number of KVM_PRE_FAULT_MEMORY ioctl calls, including interrupted calls.
+    pub ioctl_count: u64,
+    /// Worker wall time in microseconds.
+    pub wall_time_us: u64,
+}
+
+/// Completion statistics returned by the pre-fault-memory API.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct PreFaultMemoryStats {
+    /// Number of input ranges in the request.
+    pub range_count: u64,
+    /// Total bytes requested by the caller.
+    pub requested_bytes: u64,
+    /// Total bytes completed by all workers.
+    pub completed_bytes: u64,
+    /// Total bytes remaining across all workers. Successful work must be zero.
+    pub remaining_bytes: u64,
+    /// Total KVM_PRE_FAULT_MEMORY ioctl calls across all workers.
+    pub ioctl_count: u64,
+    /// End-to-end VMM wall time in microseconds, including worker dispatch and join.
+    pub wall_time_us: u64,
+    /// Per-worker completion statistics.
+    pub workers: Vec<PreFaultMemoryWorkerStats>,
+}
+
+impl PreFaultMemoryStats {
+    /// Builds aggregate statistics after every worker has reported completion.
+    pub fn from_workers(
+        ranges: &[PreFaultMemoryRange],
+        workers: Vec<PreFaultMemoryWorkerStats>,
+        wall_time_us: u64,
+    ) -> Self {
+        let requested_bytes = ranges.iter().map(|range| range.size).sum();
+        let completed_bytes = workers.iter().map(|worker| worker.completed_bytes).sum();
+        let remaining_bytes = workers.iter().map(|worker| worker.remaining_bytes).sum();
+        let ioctl_count = workers.iter().map(|worker| worker.ioctl_count).sum();
+        Self {
+            range_count: u64::try_from(ranges.len()).expect("range count exceeds u64"),
+            requested_bytes,
+            completed_bytes,
+            remaining_bytes,
+            ioctl_count,
+            wall_time_us,
+            workers,
+        }
+    }
 }
 
 /// Structural validation failures for a pre-fault request.
@@ -205,34 +267,38 @@ pub fn split_pre_fault_ranges(
 pub(crate) fn send_pre_fault_events<F>(
     work: &[Vec<PreFaultMemoryRange>],
     mut send: F,
-) -> Option<(usize, VcpuSendEventError)>
+) -> (Option<(usize, VcpuSendEventError)>, Vec<usize>)
 where
     F: FnMut(usize, Vec<PreFaultMemoryRange>) -> Result<(), VcpuSendEventError>,
 {
     let mut first_error = None;
+    let mut successful_vcpu_ids = Vec::with_capacity(work.len());
     for (vcpu_id, ranges) in work.iter().enumerate() {
-        // send_event enqueues before signaling, so even a signal error has a response to drain.
-        if let Err(error) = send(vcpu_id, ranges.clone())
-            && first_error.is_none()
-        {
-            first_error = Some((vcpu_id, error));
+        match send(vcpu_id, ranges.clone()) {
+            Ok(()) => successful_vcpu_ids.push(vcpu_id),
+            Err(error) if first_error.is_none() => first_error = Some((vcpu_id, error)),
+            Err(_) => {}
         }
     }
-    first_error
+    (first_error, successful_vcpu_ids)
 }
 
-/// Receives every response for a pre-fault operation and returns the first response error.
+/// Receives responses only from workers whose event signal succeeded.
 pub(crate) fn drain_pre_fault_responses<F>(
-    worker_count: usize,
+    worker_ids: &[usize],
     mut receive: F,
-) -> Option<PreFaultMemoryError>
+) -> Result<Vec<PreFaultMemoryWorkerStats>, PreFaultMemoryError>
 where
     F: FnMut(usize) -> Result<VcpuResponse, std::sync::mpsc::RecvError>,
 {
     let mut first_error = None;
-    for vcpu_id in 0..worker_count {
+    let mut worker_stats = Vec::with_capacity(worker_ids.len());
+    for &vcpu_id in worker_ids {
         let response_error = match receive(vcpu_id) {
-            Ok(VcpuResponse::PreFaultMemoryCompleted) => None,
+            Ok(VcpuResponse::PreFaultMemoryCompleted(stats)) => {
+                worker_stats.push(stats);
+                None
+            }
             Ok(VcpuResponse::Error(source)) => Some(PreFaultMemoryError::Vcpu { vcpu_id, source }),
             Ok(VcpuResponse::NotAllowed(reason)) => {
                 Some(PreFaultMemoryError::UnexpectedResponse { vcpu_id, reason })
@@ -254,15 +320,18 @@ where
             first_error = response_error;
         }
     }
-    first_error
+    first_error.map_or(Ok(worker_stats), Err)
 }
 
 /// Executes pre-fault ioctls for a single vCPU's work queue.
 pub fn pre_fault_memory(
     vcpu_fd: &VcpuFd,
     ranges: &[PreFaultMemoryRange],
-) -> Result<(), PreFaultMemoryIoctlError> {
-    run_pre_fault_memory(ranges, |request| {
+    vcpu_id: u32,
+) -> Result<PreFaultMemoryWorkerStats, PreFaultMemoryIoctlError> {
+    let started = Instant::now();
+    let (requested_bytes, completed_bytes, remaining_bytes, ioctl_count) =
+        run_pre_fault_memory(ranges, |request| {
         // SAFETY: The caller invokes this function from the owning vCPU thread with a valid
         // KVM vCPU fd. `kvm_pre_fault_memory` is the bindgen representation of the UAPI
         // struct, exactly 64 bytes, and remains alive and exclusively borrowed for the
@@ -273,7 +342,20 @@ pub fn pre_fault_memory(
         } else {
             Ok(())
         }
+        })?;
+    Ok(PreFaultMemoryWorkerStats {
+        vcpu_id,
+        range_count: u64::try_from(ranges.len()).expect("range count exceeds u64"),
+        requested_bytes,
+        completed_bytes,
+        remaining_bytes,
+        ioctl_count,
+        wall_time_us: elapsed_us(started),
     })
+}
+
+fn elapsed_us(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 const KVMIO: ::std::os::raw::c_uint = 0xAE;
@@ -291,10 +373,13 @@ use pre_fault_memory_ioctl::KVM_PRE_FAULT_MEMORY;
 fn run_pre_fault_memory<F>(
     ranges: &[PreFaultMemoryRange],
     mut ioctl: F,
-) -> Result<(), PreFaultMemoryIoctlError>
+) -> Result<(u64, u64, u64, u64), PreFaultMemoryIoctlError>
 where
     F: FnMut(&mut kvm_pre_fault_memory) -> io::Result<()>,
 {
+    let requested_bytes: u64 = ranges.iter().map(|range| range.size).sum();
+    let mut completed_bytes = 0;
+    let mut ioctl_count = 0;
     for range in ranges {
         let mut request = kvm_pre_fault_memory {
             gpa: range.gpa,
@@ -309,6 +394,7 @@ where
             request.flags = 0;
             request.padding = [0; 5];
 
+            ioctl_count += 1;
             match ioctl(&mut request) {
                 Err(error) if error.raw_os_error() == Some(libc::EINTR) => {
                     request.gpa = previous_gpa;
@@ -327,12 +413,15 @@ where
                         size: request.size,
                     });
                 }
-                Ok(()) => {}
+                Ok(()) => completed_bytes += previous_size - request.size,
             }
         }
     }
 
-    Ok(())
+    let remaining_bytes = requested_bytes
+        .checked_sub(completed_bytes)
+        .expect("pre-fault completion cannot exceed bytes requested");
+    Ok((requested_bytes, completed_bytes, remaining_bytes, ioctl_count))
 }
 
 #[cfg(test)]
@@ -345,6 +434,13 @@ mod tests {
 
     fn range(gpa: u64, size: u64) -> PreFaultMemoryRange {
         PreFaultMemoryRange { gpa, size }
+    }
+
+    fn worker_stats(vcpu_id: u32) -> PreFaultMemoryWorkerStats {
+        PreFaultMemoryWorkerStats {
+            vcpu_id,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -441,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn signal_failure_is_recorded_and_all_workers_are_drained() {
+    fn signal_failure_skips_unresponsive_worker() {
         let work = vec![
             vec![range(0, 0x1000)],
             vec![range(0x1000, 0x1000)],
@@ -449,7 +545,7 @@ mod tests {
         ];
         let mut sent = Vec::new();
         let mut receiving = false;
-        let send_error = send_pre_fault_events(&work, |vcpu_id, _ranges| {
+        let (send_error, successful_vcpu_ids) = send_pre_fault_events(&work, |vcpu_id, _ranges| {
             assert!(!receiving);
             sent.push(vcpu_id);
             if vcpu_id == 1 {
@@ -462,21 +558,21 @@ mod tests {
         });
         assert_eq!(sent, vec![0, 1, 2]);
         assert_eq!(send_error.as_ref().map(|(vcpu_id, _)| *vcpu_id), Some(1));
+        assert_eq!(successful_vcpu_ids, vec![0, 2]);
 
         let mut first_error =
             send_error.map(|(vcpu_id, source)| PreFaultMemoryError::VcpuSend { vcpu_id, source });
         let mut responses = VecDeque::from([
-            VcpuResponse::PreFaultMemoryCompleted,
-            VcpuResponse::PreFaultMemoryCompleted,
-            VcpuResponse::PreFaultMemoryCompleted,
+            VcpuResponse::PreFaultMemoryCompleted(worker_stats(0)),
+            VcpuResponse::PreFaultMemoryCompleted(worker_stats(2)),
         ]);
-        let response_error = drain_pre_fault_responses(work.len(), |_vcpu_id| {
+        let response_error = drain_pre_fault_responses(&successful_vcpu_ids, |_vcpu_id| {
             receiving = true;
             assert!(receiving);
             Ok(responses.pop_front().expect("missing test response"))
         });
         if first_error.is_none() {
-            first_error = response_error;
+            first_error = response_error.err();
         }
 
         assert!(matches!(
@@ -490,17 +586,17 @@ mod tests {
     fn response_failure_does_not_skip_other_workers() {
         let mut responses = VecDeque::from([
             VcpuResponse::Error(VcpuError::FaultyKvmExit("worker failure".to_string())),
-            VcpuResponse::PreFaultMemoryCompleted,
-            VcpuResponse::PreFaultMemoryCompleted,
+            VcpuResponse::PreFaultMemoryCompleted(worker_stats(1)),
+            VcpuResponse::PreFaultMemoryCompleted(worker_stats(2)),
         ]);
 
-        let error = drain_pre_fault_responses(3, |_vcpu_id| {
+        let error = drain_pre_fault_responses(&[0, 1, 2], |_vcpu_id| {
             Ok(responses.pop_front().expect("missing test response"))
         });
 
         assert!(matches!(
             error,
-            Some(PreFaultMemoryError::Vcpu { vcpu_id: 0, .. })
+            Err(PreFaultMemoryError::Vcpu { vcpu_id: 0, .. })
         ));
         assert!(responses.is_empty());
     }
@@ -512,20 +608,20 @@ mod tests {
         let worker = thread::spawn(move || {
             release_receiver.recv().unwrap();
             response_sender
-                .send(VcpuResponse::PreFaultMemoryCompleted)
+                .send(VcpuResponse::PreFaultMemoryCompleted(worker_stats(0)))
                 .unwrap();
             response_sender.send(VcpuResponse::Resumed).unwrap();
         });
 
         let mut first_receive = true;
-        let error = drain_pre_fault_responses(1, |_vcpu_id| {
+        let error = drain_pre_fault_responses(&[0], |_vcpu_id| {
             assert!(first_receive);
             first_receive = false;
             release_sender.send(()).unwrap();
             response_receiver.recv()
         });
 
-        assert!(error.is_none());
+        assert!(error.is_ok());
         assert!(matches!(
             response_receiver.recv().unwrap(),
             VcpuResponse::Resumed
@@ -561,7 +657,7 @@ mod tests {
     fn ioctl_loop_handles_partial_progress_and_eintr() {
         let ranges = [range(0x1000, 0x3000)];
         let mut calls = 0;
-        run_pre_fault_memory(&ranges, |request| {
+        let stats = run_pre_fault_memory(&ranges, |request| {
             calls += 1;
             assert_eq!(request.flags, 0);
             assert_eq!(request.padding, [0; 5]);
@@ -578,6 +674,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(calls, 4);
+        assert_eq!(stats, (0x3000, 0x3000, 0, 4));
     }
 
     #[test]

@@ -843,8 +843,10 @@ paths:
           schema:
             $ref: "#/definitions/PreFaultMemoryRequest"
       responses:
-        204:
+        200:
           description: Pre-fault completed successfully.
+          schema:
+            $ref: "#/definitions/PreFaultMemoryStats"
         400:
           description: Invalid request, unsupported host capability, or VM state.
           schema:
@@ -1430,6 +1432,77 @@ definitions:
         minItems: 1
         items:
           $ref: "#/definitions/PreFaultMemoryRange"
+
+  PreFaultMemoryWorkerStats:
+    type: object
+    description: Completion statistics for work assigned to one vCPU worker.
+    additionalProperties: false
+    required:
+      - vcpu_id
+      - range_count
+      - requested_bytes
+      - completed_bytes
+      - remaining_bytes
+      - ioctl_count
+      - wall_time_us
+    properties:
+      vcpu_id:
+        type: integer
+        format: int32
+      range_count:
+        type: integer
+        format: int64
+      requested_bytes:
+        type: integer
+        format: int64
+      completed_bytes:
+        type: integer
+        format: int64
+      remaining_bytes:
+        type: integer
+        format: int64
+      ioctl_count:
+        type: integer
+        format: int64
+      wall_time_us:
+        type: integer
+        format: int64
+
+  PreFaultMemoryStats:
+    type: object
+    description: Completion statistics for a paused guest-memory pre-fault request.
+    additionalProperties: false
+    required:
+      - range_count
+      - requested_bytes
+      - completed_bytes
+      - remaining_bytes
+      - ioctl_count
+      - wall_time_us
+      - workers
+    properties:
+      range_count:
+        type: integer
+        format: int64
+      requested_bytes:
+        type: integer
+        format: int64
+      completed_bytes:
+        type: integer
+        format: int64
+      remaining_bytes:
+        type: integer
+        format: int64
+      ioctl_count:
+        type: integer
+        format: int64
+      wall_time_us:
+        type: integer
+        format: int64
+      workers:
+        type: array
+        items:
+          $ref: "#/definitions/PreFaultMemoryWorkerStats"
 
   DirtyMemoryRange:
     type: object

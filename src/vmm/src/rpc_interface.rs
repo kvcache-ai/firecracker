@@ -46,7 +46,9 @@ use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, Snap
 use crate::vmm_config::vsock::{VsockConfigError, VsockDeviceConfig};
 use crate::vmm_config::{self, RateLimiterUpdate};
 use crate::vstate::memory::{DirtyMemoryRanges, GuestMemory};
-use crate::vstate::prefault::{PreFaultMemoryError, PreFaultMemoryRequest};
+use crate::vstate::prefault::{
+    PreFaultMemoryError, PreFaultMemoryRequest, PreFaultMemoryStats,
+};
 use crate::vstate::vm::VmError;
 
 /// This enum represents the public interface of the VMM. Each action contains various
@@ -235,6 +237,8 @@ pub enum VmmData {
     DirtyMemoryRanges(DirtyMemoryRanges),
     /// The guest memory region mappings.
     GuestMemoryRegions(Vec<GuestRegionUffdMapping>),
+    /// Completion statistics for a guest-memory pre-fault request.
+    PreFaultMemoryStats(PreFaultMemoryStats),
     /// The microVM configuration represented by `VmConfig`.
     MachineConfiguration(MachineConfig),
     /// Mmds contents.
@@ -881,7 +885,7 @@ impl RuntimeApiController {
             .lock()
             .expect("Poisoned lock")
             .pre_fault_memory(request)
-            .map(|()| VmmData::Empty)
+            .map(VmmData::PreFaultMemoryStats)
             .map_err(VmmActionError::PreFaultMemory)
     }
 

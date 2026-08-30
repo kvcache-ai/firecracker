@@ -215,6 +215,7 @@ impl ParsedRequest {
                 VmmData::FullVmConfig(config) => Self::success_response_with_data(config),
                 VmmData::DirtyMemoryRanges(ranges) => Self::success_response_with_data(ranges),
                 VmmData::GuestMemoryRegions(regions) => Self::success_response_with_data(regions),
+                VmmData::PreFaultMemoryStats(stats) => Self::success_response_with_data(stats),
             },
             Err(vmm_action_error) => {
                 let mut response = match vmm_action_error {
@@ -692,6 +693,9 @@ pub mod tests {
                 }
                 VmmData::GuestMemoryRegions(regions) => {
                     http_response(&serde_json::to_string(regions).unwrap(), 200)
+                }
+                VmmData::PreFaultMemoryStats(stats) => {
+                    http_response(&serde_json::to_string(stats).unwrap(), 200)
                 }
                 VmmData::MachineConfiguration(cfg) => {
                     http_response(&serde_json::to_string(cfg).unwrap(), 200)
