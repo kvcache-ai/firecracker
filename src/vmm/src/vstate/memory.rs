@@ -51,6 +51,28 @@ pub struct DirtyMemoryRanges {
     pub ranges: Vec<DirtyMemoryRange>,
 }
 
+/// A contiguous resident-memory range in the snapshot memory image layout.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResidentMemoryRange {
+    /// Base host virtual address where this resident range currently resides.
+    pub base_host_virt_addr: u64,
+    /// Offset in the contiguous memory snapshot image.
+    pub image_offset: u64,
+    /// Length of the resident range in bytes.
+    pub length: u64,
+}
+
+/// Resident memory ranges for a VM, using the same contiguous layout as memory snapshots.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResidentMemoryRanges {
+    /// Page size used by `mincore(2)`.
+    pub page_size: usize,
+    /// Total size of the contiguous memory snapshot image.
+    pub memory_size: u64,
+    /// Resident ranges coalesced across adjacent pages within each memory slot.
+    pub ranges: Vec<ResidentMemoryRange>,
+}
+
 /// Type of GuestRegionMmap.
 pub type GuestRegionMmap = vm_memory::GuestRegionMmap<Option<AtomicBitmap>>;
 /// Type of GuestMemoryMmap.
