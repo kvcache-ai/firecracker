@@ -549,10 +549,17 @@ fn assert_pre_fault_supported_or_host_unsupported(result: Result<VmmData, VmmAct
                 ..
             })) if error.raw_os_error() == Some(libc::EOPNOTSUPP)
         );
-        assert!(
-            matches!(&result, Ok(VmmData::Empty)) || mode_unsupported,
-            "KVM_CAP_PRE_FAULT_MEMORY={capability}, expected success or EOPNOTSUPP for the current vCPU mode, got {result:?}"
-        );
+        match &result {
+            Ok(VmmData::PreFaultMemoryStats(stats)) => {
+                assert_eq!(stats.requested_bytes, stats.completed_bytes);
+                assert_eq!(stats.remaining_bytes, 0);
+                assert!(!stats.workers.is_empty());
+            }
+            _ => assert!(
+                mode_unsupported,
+                "KVM_CAP_PRE_FAULT_MEMORY={capability}, expected completion stats or EOPNOTSUPP for the current vCPU mode, got {result:?}"
+            ),
+        }
     } else {
         assert!(
             matches!(

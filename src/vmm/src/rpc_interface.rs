@@ -45,8 +45,10 @@ use crate::vmm_config::serial::SerialConfig;
 use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, SnapshotType};
 use crate::vmm_config::vsock::{VsockConfigError, VsockDeviceConfig};
 use crate::vmm_config::{self, RateLimiterUpdate};
-use crate::vstate::memory::{DirtyMemoryRanges, GuestMemory};
-use crate::vstate::prefault::{PreFaultMemoryError, PreFaultMemoryRequest};
+use crate::vstate::memory::{DirtyMemoryRanges, GuestMemory, ResidentMemoryRanges};
+use crate::vstate::prefault::{
+    PreFaultMemoryError, PreFaultMemoryRequest, PreFaultMemoryStats,
+};
 use crate::vstate::vm::VmError;
 
 /// This enum represents the public interface of the VMM. Each action contains various
@@ -75,6 +77,8 @@ pub enum VmmAction {
     GetFullVmConfig,
     /// Get dirty guest memory ranges. Post-boot only.
     GetDirtyMemoryRanges,
+    /// Get resident guest memory ranges. Post-boot only.
+    GetResidentMemoryRanges,
     /// Get guest memory region mappings. Post-boot only.
     GetGuestMemoryRegions,
     /// Pre-fault selected guest memory. Paused VM only.
@@ -172,6 +176,8 @@ pub enum VmmActionError {
     CreateSnapshot(#[from] CreateSnapshotError),
     /// Dirty memory ranges error: {0}
     DirtyMemoryRanges(#[from] VmError),
+    /// Resident memory ranges error: {0}
+    ResidentMemoryRanges(VmError),
     /// Pre-fault memory error: {0}
     PreFaultMemory(#[from] PreFaultMemoryError),
     /// Configure CPU error: {0}
@@ -233,8 +239,12 @@ pub enum VmmData {
     FullVmConfig(VmmConfig),
     /// The dirty guest memory ranges.
     DirtyMemoryRanges(DirtyMemoryRanges),
+    /// The resident guest memory ranges.
+    ResidentMemoryRanges(ResidentMemoryRanges),
     /// The guest memory region mappings.
     GuestMemoryRegions(Vec<GuestRegionUffdMapping>),
+    /// Completion statistics for a guest-memory pre-fault request.
+    PreFaultMemoryStats(PreFaultMemoryStats),
     /// The microVM configuration represented by `VmConfig`.
     MachineConfiguration(MachineConfig),
     /// Mmds contents.
@@ -507,6 +517,7 @@ impl<'a> PrebootApiController<'a> {
             CreateSnapshot(_)
             | FlushMetrics
             | GetDirtyMemoryRanges
+            | GetResidentMemoryRanges
             | GetGuestMemoryRegions
             | Pause
             | Resume
@@ -722,6 +733,7 @@ impl RuntimeApiController {
                 self.vmm.lock().expect("Poisoned lock").full_config(),
             )),
             GetDirtyMemoryRanges => self.get_dirty_memory_ranges(),
+            GetResidentMemoryRanges => self.get_resident_memory_ranges(),
             GetGuestMemoryRegions => self.get_guest_memory_regions(),
             PreFaultMemory(request) => self.pre_fault_memory(request),
             GetMemoryHotplugStatus => self
@@ -881,7 +893,7 @@ impl RuntimeApiController {
             .lock()
             .expect("Poisoned lock")
             .pre_fault_memory(request)
-            .map(|()| VmmData::Empty)
+            .map(VmmData::PreFaultMemoryStats)
             .map_err(VmmActionError::PreFaultMemory)
     }
 
@@ -977,6 +989,16 @@ impl RuntimeApiController {
         let locked_vmm = self.vmm.lock().expect("Poisoned lock");
         let ranges = locked_vmm.vm.get_dirty_memory_ranges_preserve()?;
         Ok(VmmData::DirtyMemoryRanges(ranges))
+    }
+
+    /// Returns host-resident memory ranges for working-set profilers.
+    fn get_resident_memory_ranges(&self) -> Result<VmmData, VmmActionError> {
+        let locked_vmm = self.vmm.lock().expect("Poisoned lock");
+        let ranges = locked_vmm
+            .vm
+            .get_resident_memory_ranges()
+            .map_err(VmmActionError::ResidentMemoryRanges)?;
+        Ok(VmmData::ResidentMemoryRanges(ranges))
     }
 
     /// Updates block device properties:
@@ -1215,6 +1237,7 @@ mod tests {
         check_unsupported(preboot_request(VmmAction::Resume));
         check_unsupported(preboot_request(VmmAction::GetBalloonStats));
         check_unsupported(preboot_request(VmmAction::GetDirtyMemoryRanges));
+        check_unsupported(preboot_request(VmmAction::GetResidentMemoryRanges));
         check_unsupported(preboot_request(VmmAction::GetGuestMemoryRegions));
         let pre_fault_result = preboot_request(VmmAction::PreFaultMemory(
             PreFaultMemoryRequest {
@@ -1314,6 +1337,18 @@ mod tests {
                 assert_ne!(dirty_ranges.memory_size, 0);
             }
             other => panic!("Expected DirtyMemoryRanges, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_runtime_get_resident_memory_ranges() {
+        let result = runtime_request(VmmAction::GetResidentMemoryRanges).unwrap();
+        match result {
+            VmmData::ResidentMemoryRanges(resident_ranges) => {
+                assert_eq!(resident_ranges.page_size, 4096);
+                assert_ne!(resident_ranges.memory_size, 0);
+            }
+            other => panic!("Expected ResidentMemoryRanges, got {:?}", other),
         }
     }
 

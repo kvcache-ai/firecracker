@@ -29,7 +29,9 @@ use crate::utils::signal::{Killable, register_signal_handler, sigrtmin};
 use crate::utils::sm::StateMachine;
 use crate::vstate::bus::Bus;
 use crate::vstate::prefault::pre_fault_memory;
-use crate::vstate::prefault::{PreFaultMemoryIoctlError, PreFaultMemoryRange};
+use crate::vstate::prefault::{
+    PreFaultMemoryIoctlError, PreFaultMemoryRange, PreFaultMemoryWorkerStats,
+};
 use crate::vstate::vm::Vm;
 
 /// Signal number (SIGRTMIN) used to kick Vcpus.
@@ -286,7 +288,7 @@ impl Vcpu {
                     .expect("vcpu channel unexpectedly closed");
             }
             // Pre-faulting cannot be performed on a running Vcpu.
-            Ok(VcpuEvent::PreFaultMemory(_)) => {
+            Ok(VcpuEvent::PreFaultMemory { .. }) => {
                 self.response_sender
                     .send(VcpuResponse::NotAllowed(String::from(
                         "pre-fault memory requires a paused vCPU",
@@ -363,11 +365,11 @@ impl Vcpu {
 
                 StateMachine::next(Self::paused)
             }
-            Ok(VcpuEvent::PreFaultMemory(ranges)) => {
-                pre_fault_memory(&self.kvm_vcpu.fd, &ranges)
-                    .map(|()| {
+            Ok(VcpuEvent::PreFaultMemory { ranges }) => {
+                pre_fault_memory(&self.kvm_vcpu.fd, &ranges, u32::from(self.kvm_vcpu.index))
+                    .map(|stats| {
                         self.response_sender
-                            .send(VcpuResponse::PreFaultMemoryCompleted)
+                            .send(VcpuResponse::PreFaultMemoryCompleted(stats))
                             .expect("vcpu channel unexpectedly closed");
                     })
                     .unwrap_or_else(|err| {
@@ -549,7 +551,10 @@ pub enum VcpuEvent {
     /// Event to dump CPU configuration of a paused Vcpu.
     DumpCpuConfig,
     /// Event to pre-fault selected memory of a paused Vcpu.
-    PreFaultMemory(Vec<PreFaultMemoryRange>),
+    PreFaultMemory {
+        /// Work assigned to this vCPU.
+        ranges: Vec<PreFaultMemoryRange>,
+    },
 }
 
 /// List of responses that the Vcpu reports.
@@ -568,8 +573,8 @@ pub enum VcpuResponse {
     SavedState(Box<VcpuState>),
     /// Vcpu is in the state where CPU config is dumped.
     DumpedCpuConfig(Box<CpuConfiguration>),
-    /// Requested memory pre-faulting completed.
-    PreFaultMemoryCompleted,
+    /// Requested memory pre-faulting completed, with per-worker statistics.
+    PreFaultMemoryCompleted(PreFaultMemoryWorkerStats),
 }
 
 impl fmt::Debug for VcpuResponse {
@@ -583,7 +588,9 @@ impl fmt::Debug for VcpuResponse {
             Error(err) => write!(f, "VcpuResponse::Error({:?})", err),
             NotAllowed(reason) => write!(f, "VcpuResponse::NotAllowed({})", reason),
             DumpedCpuConfig(_) => write!(f, "VcpuResponse::DumpedCpuConfig"),
-            PreFaultMemoryCompleted => write!(f, "VcpuResponse::PreFaultMemoryCompleted"),
+            PreFaultMemoryCompleted(stats) => {
+                write!(f, "VcpuResponse::PreFaultMemoryCompleted({stats:?})")
+            }
         }
     }
 }
@@ -845,7 +852,7 @@ pub(crate) mod tests {
                 | NotAllowed(_)
                 | SavedState(_)
                 | DumpedCpuConfig(_)
-                | PreFaultMemoryCompleted => (),
+                | PreFaultMemoryCompleted(_) => (),
             };
             match (self, other) {
                 (Paused, Paused) | (Resumed, Resumed) => true,
@@ -853,7 +860,7 @@ pub(crate) mod tests {
                 (NotAllowed(_), NotAllowed(_))
                 | (SavedState(_), SavedState(_))
                 | (DumpedCpuConfig(_), DumpedCpuConfig(_))
-                | (PreFaultMemoryCompleted, PreFaultMemoryCompleted) => true,
+                | (PreFaultMemoryCompleted(_), PreFaultMemoryCompleted(_)) => true,
                 (Error(err), Error(other_err)) => {
                     format!("{:?}", err) == format!("{:?}", other_err)
                 }

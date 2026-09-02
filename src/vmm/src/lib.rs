@@ -168,7 +168,9 @@ use crate::vstate::memory::{
     GuestAddress, GuestMemory, GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion,
     GuestRegionType,
 };
-use crate::vstate::prefault::{PreFaultMemoryError, PreFaultMemoryRequest};
+use crate::vstate::prefault::{
+    PreFaultMemoryError, PreFaultMemoryRequest, PreFaultMemoryStats,
+};
 use crate::vstate::prefault::{
     drain_pre_fault_responses, send_pre_fault_events, split_pre_fault_ranges,
 };
@@ -559,7 +561,7 @@ impl Vmm {
     pub fn pre_fault_memory(
         &mut self,
         request: PreFaultMemoryRequest,
-    ) -> Result<(), PreFaultMemoryError> {
+    ) -> Result<PreFaultMemoryStats, PreFaultMemoryError> {
         request.validate()?;
 
         if self.instance_info.state != VmState::Paused {
@@ -603,27 +605,31 @@ impl Vmm {
         }
 
         let work = split_pre_fault_ranges(&request.ranges, self.vcpus_handles.len())?;
+        let started = std::time::Instant::now();
 
         // Send every work queue before waiting for any response. This lets the kernel fault pages
         // on all vCPU threads concurrently.
-        let send_error = send_pre_fault_events(&work, |vcpu_id, ranges| {
-            self.vcpus_handles[vcpu_id].send_event(VcpuEvent::PreFaultMemory(ranges))
+        let (send_error, successful_vcpu_ids) = send_pre_fault_events(&work, |vcpu_id, ranges| {
+            self.vcpus_handles[vcpu_id].send_event(VcpuEvent::PreFaultMemory { ranges })
         });
 
-        // Drain every response for every worker whose send_event call returned, even after one
-        // worker fails. Completed kernel work is intentionally not rolled back. This is a
-        // blocking receive because a fixed timeout could leave a completed response queued and
-        // have the next Resume/Save operation consume it.
-        let response_error = drain_pre_fault_responses(work.len(), |vcpu_id| {
+        // Only drain workers whose event signal succeeded. `send_event` queues before signaling,
+        // but a signal failure can mean the vCPU thread has already exited and will never send a
+        // response. Waiting for that worker would leave the paused VM permanently blocked.
+        let worker_stats = drain_pre_fault_responses(&successful_vcpu_ids, |vcpu_id| {
             self.vcpus_handles[vcpu_id].response_receiver().recv()
         });
-        match send_error
-            .map(|(vcpu_id, source)| PreFaultMemoryError::VcpuSend { vcpu_id, source })
-            .or(response_error)
-        {
-            Some(error) => Err(error),
-            None => Ok(()),
+        if let Some((vcpu_id, source)) = send_error {
+            return Err(PreFaultMemoryError::VcpuSend { vcpu_id, source });
         }
+        let stats = PreFaultMemoryStats::from_workers(
+            &request.ranges,
+            worker_stats?,
+            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        );
+        debug_assert_eq!(stats.requested_bytes, stats.completed_bytes);
+        debug_assert_eq!(stats.remaining_bytes, 0);
+        Ok(stats)
     }
 
     /// Injects CTRL+ALT+DEL keystroke combo in the i8042 device.

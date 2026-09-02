@@ -35,7 +35,8 @@ use crate::vstate::bus::Bus;
 use crate::vstate::interrupts::{InterruptError, MsixVector, MsixVectorConfig, MsixVectorGroup};
 use crate::vstate::memory::{
     DirtyMemoryRanges, GuestMemory, GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion,
-    GuestMemoryState, GuestRegionMmap, GuestRegionMmapExt, MemoryError,
+    GuestMemoryState, GuestRegionMmap, GuestRegionMmapExt, MemoryError, ResidentMemoryRange,
+    ResidentMemoryRanges,
 };
 use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vcpu::VcpuError;
@@ -339,6 +340,44 @@ impl Vm {
         self.guest_memory()
             .dirty_memory_ranges(&dirty_bitmap, page_size)
             .map_err(VmError::MemoryError)
+    }
+
+    /// Returns host-resident guest-memory ranges according to `mincore(2)`.
+    ///
+    /// This is intentionally independent from KVM dirty-page tracking and does
+    /// not read or modify any dirty bitmap state.
+    pub fn get_resident_memory_ranges(&self) -> Result<ResidentMemoryRanges, VmError> {
+        let resident_bitmap = self
+            .guest_memory()
+            .iter()
+            .flat_map(|region| region.plugged_slots())
+            .map(|mem_slot| {
+                mincore_bitmap(
+                    mem_slot.slice.ptr_guard_mut().as_ptr(),
+                    mem_slot.slice.len(),
+                )
+                .map(|bitmap| (mem_slot.slot, bitmap))
+            })
+            .collect::<Result<DirtyBitmap, VmError>>()?;
+        let page_size = get_page_size().map_err(MemoryError::PageSize)?;
+        let ranges = self
+            .guest_memory()
+            .dirty_memory_ranges(&resident_bitmap, page_size)
+            .map_err(VmError::MemoryError)?;
+
+        Ok(ResidentMemoryRanges {
+            page_size: ranges.page_size,
+            memory_size: ranges.memory_size,
+            ranges: ranges
+                .ranges
+                .into_iter()
+                .map(|range| ResidentMemoryRange {
+                    base_host_virt_addr: range.base_host_virt_addr,
+                    image_offset: range.image_offset,
+                    length: range.length,
+                })
+                .collect(),
+        })
     }
 
     /// Takes a snapshot of the virtual machine running inside the given [`Vmm`] and saves it to

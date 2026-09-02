@@ -89,6 +89,9 @@ impl TryFrom<&Request> for ParsedRequest {
                 Some("dirty-memory-ranges") => {
                     Ok(ParsedRequest::new_sync(VmmAction::GetDirtyMemoryRanges))
                 }
+                Some("resident-memory-ranges") => {
+                    Ok(ParsedRequest::new_sync(VmmAction::GetResidentMemoryRanges))
+                }
                 Some("guest-memory-regions") => {
                     Ok(ParsedRequest::new_sync(VmmAction::GetGuestMemoryRegions))
                 }
@@ -214,7 +217,9 @@ impl ParsedRequest {
                 ),
                 VmmData::FullVmConfig(config) => Self::success_response_with_data(config),
                 VmmData::DirtyMemoryRanges(ranges) => Self::success_response_with_data(ranges),
+                VmmData::ResidentMemoryRanges(ranges) => Self::success_response_with_data(ranges),
                 VmmData::GuestMemoryRegions(regions) => Self::success_response_with_data(regions),
+                VmmData::PreFaultMemoryStats(stats) => Self::success_response_with_data(stats),
             },
             Err(vmm_action_error) => {
                 let mut response = match vmm_action_error {
@@ -367,7 +372,9 @@ pub mod tests {
     use vmm::vmm_config::balloon::{BalloonDeviceConfig, BalloonStats};
     use vmm::vmm_config::instance_info::InstanceInfo;
     use vmm::vmm_config::machine_config::MachineConfig;
-    use vmm::vstate::memory::{DirtyMemoryRange, DirtyMemoryRanges};
+    use vmm::vstate::memory::{
+        DirtyMemoryRange, DirtyMemoryRanges, ResidentMemoryRange, ResidentMemoryRanges,
+    };
 
     use super::*;
 
@@ -690,8 +697,14 @@ pub mod tests {
                 VmmData::DirtyMemoryRanges(ranges) => {
                     http_response(&serde_json::to_string(ranges).unwrap(), 200)
                 }
+                VmmData::ResidentMemoryRanges(ranges) => {
+                    http_response(&serde_json::to_string(ranges).unwrap(), 200)
+                }
                 VmmData::GuestMemoryRegions(regions) => {
                     http_response(&serde_json::to_string(regions).unwrap(), 200)
+                }
+                VmmData::PreFaultMemoryStats(stats) => {
+                    http_response(&serde_json::to_string(stats).unwrap(), 200)
                 }
                 VmmData::MachineConfiguration(cfg) => {
                     http_response(&serde_json::to_string(cfg).unwrap(), 200)
@@ -727,6 +740,15 @@ pub mod tests {
             page_size: 4096,
             memory_size: 8192,
             ranges: vec![DirtyMemoryRange {
+                base_host_virt_addr: 0x7f0000000000,
+                image_offset: 0,
+                length: 4096,
+            }],
+        }));
+        verify_ok_response_with(VmmData::ResidentMemoryRanges(ResidentMemoryRanges {
+            page_size: 4096,
+            memory_size: 8192,
+            ranges: vec![ResidentMemoryRange {
                 base_host_virt_addr: 0x7f0000000000,
                 image_offset: 0,
                 length: 4096,
@@ -870,6 +892,22 @@ pub mod tests {
         assert_eq!(
             vmm_action_from_request(parsed),
             VmmAction::GetDirtyMemoryRanges
+        );
+    }
+
+    #[test]
+    fn test_try_from_get_resident_memory_ranges() {
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        let mut connection = HttpConnection::new(receiver);
+        sender
+            .write_all(http_request("GET", "/vm/resident-memory-ranges", None).as_bytes())
+            .unwrap();
+        connection.try_read().unwrap();
+        let req = connection.pop_parsed_request().unwrap();
+        let parsed = ParsedRequest::try_from(&req).unwrap();
+        assert_eq!(
+            vmm_action_from_request(parsed),
+            VmmAction::GetResidentMemoryRanges
         );
     }
 
