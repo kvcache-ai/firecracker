@@ -1,0 +1,45 @@
+name: Nested KVM tools
+
+on:
+  pull_request:
+    paths:
+      - "tools/nestedvirt/**"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/nestedvirt-tools.yml"
+  push:
+    paths:
+      - "tools/nestedvirt/**"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/nestedvirt-tools.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python3 -m py_compile tools/nestedvirt/prepare_probe.py tools/nestedvirt/raw_smoke.py
+      - run: |
+          for script in tools/nestedvirt/*.sh; do
+            bash -n "$script"
+          done
+
+  legacy-snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - run: sudo apt-get update && sudo apt-get install -y clang libclang-dev pkg-config
+      - run: |
+          cargo test --locked --target x86_64-unknown-linux-gnu -p vmm --lib snapshot:: -- --test-threads=1

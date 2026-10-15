@@ -5,7 +5,7 @@ use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
 
 use vmm::persist::MicrovmState;
-use vmm::snapshot::Snapshot;
+use vmm::snapshot::{LoadedMicrovmSnapshot, Snapshot, load_microvm_snapshot};
 
 // Some errors are only used in aarch64 code
 #[allow(unused)]
@@ -22,9 +22,9 @@ pub enum UtilsError {
 }
 
 #[allow(unused)]
-pub fn open_vmstate(snapshot_path: &PathBuf) -> Result<Snapshot<MicrovmState>, UtilsError> {
+pub fn open_vmstate(snapshot_path: &PathBuf) -> Result<LoadedMicrovmSnapshot, UtilsError> {
     let mut snapshot_reader = File::open(snapshot_path).map_err(UtilsError::VmStateFileOpen)?;
-    Snapshot::load(&mut snapshot_reader).map_err(UtilsError::VmStateLoad)
+    load_microvm_snapshot(&mut snapshot_reader).map_err(UtilsError::VmStateLoad)
 }
 
 // This method is used only in aarch64 code so far

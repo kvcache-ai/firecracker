@@ -69,6 +69,8 @@ pub enum KvmVcpuError {
     VcpuGetMsr(u32),
     /// Failed to get KVM vcpu msrs: {0}
     VcpuGetMsrs(kvm_ioctls::Error),
+    /// Failed to check KVM nested-state capability: {0}
+    VcpuCheckNestedState(kvm_ioctls::Error),
     /// Failed to get KVM vcpu nested state: {0}
     VcpuGetNestedState(kvm_ioctls::Error),
     /// Failed to get KVM vcpu regs: {0}
@@ -160,6 +162,8 @@ pub struct KvmVcpu {
     ///
     /// `None` if `KVM_CAP_XSAVE2` not supported.
     xsave2_size: Option<usize>,
+    /// Whether KVM supports saving nested state on this VM.
+    nested_state_supported: bool,
 }
 
 /// Vcpu peripherals
@@ -208,12 +212,24 @@ impl KvmVcpu {
             .create_vcpu(index.into())
             .map_err(KvmVcpuError::VcpuFd)?;
 
+        let nested_state_supported = match vm.fd().check_extension_int(kvm_ioctls::Cap::NestedState)
+        {
+            ..=-1 => {
+                return Err(KvmVcpuError::VcpuCheckNestedState(
+                    vmm_sys_util::errno::Error::last(),
+                ));
+            }
+            0 => false,
+            _ => true,
+        };
+
         Ok(KvmVcpu {
             index,
             fd: kvm_vcpu,
             peripherals: Default::default(),
             msrs_to_save: vm.msrs_to_save().to_vec(),
             xsave2_size: vm.xsave2_size(),
+            nested_state_supported,
         })
     }
 
@@ -622,12 +638,15 @@ impl KvmVcpu {
             None
         });
         let cpuid = self.get_cpuid()?;
-        let mut nested_state = KvmNestedStateBuffer::empty();
-        let _ = self
-            .fd
-            .nested_state(&mut nested_state)
-            .map_err(KvmVcpuError::VcpuGetNestedState)?;
-        let nested_state = has_nested_state(&nested_state).then_some(nested_state);
+        let nested_state = if self.nested_state_supported {
+            let mut state = KvmNestedStateBuffer::empty();
+            self.fd
+                .nested_state(&mut state)
+                .map_err(KvmVcpuError::VcpuGetNestedState)?;
+            has_nested_state(&state).then_some(state)
+        } else {
+            None
+        };
         let saved_msrs = self.get_msr_chunks(self.msrs_to_save.iter().copied())?;
         let vcpu_events = self
             .fd
@@ -1199,6 +1218,13 @@ mod tests {
             // overflow
             assert!(vcpu.is_tsc_scaling_required(30_000_000).unwrap());
         }
+    }
+
+    #[test]
+    fn test_save_state_without_nested_capability() {
+        let (_kvm, _vm, mut vcpu) = setup_vcpu(0x1000);
+        vcpu.nested_state_supported = false;
+        assert!(vcpu.save_state().unwrap().nested_state.is_none());
     }
 
     #[test]
