@@ -10,9 +10,10 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use kvm_bindings::{
-    CpuId, KVM_MAX_CPUID_ENTRIES, KVM_MAX_MSR_ENTRIES, KVM_STATE_NESTED_FORMAT_VMX, Msrs, Xsave,
-    kvm_debugregs, kvm_lapic_state, kvm_mp_state, kvm_nested_state, kvm_regs, kvm_sregs,
-    kvm_vcpu_events, kvm_xcrs, kvm_xsave, kvm_xsave2, nested::KvmNestedStateBuffer,
+    CpuId, KVM_MAX_CPUID_ENTRIES, KVM_MAX_MSR_ENTRIES, KVM_STATE_NESTED_FORMAT_SVM,
+    KVM_STATE_NESTED_FORMAT_VMX, Msrs, Xsave, kvm_debugregs, kvm_lapic_state, kvm_mp_state,
+    kvm_nested_state, kvm_regs, kvm_sregs, kvm_vcpu_events, kvm_xcrs, kvm_xsave, kvm_xsave2,
+    nested::KvmNestedStateBuffer,
 };
 use kvm_ioctls::{VcpuExit, VcpuFd};
 use log::{error, warn};
@@ -69,6 +70,8 @@ pub enum KvmVcpuError {
     VcpuGetMsr(u32),
     /// Failed to get KVM vcpu msrs: {0}
     VcpuGetMsrs(kvm_ioctls::Error),
+    /// Failed to check KVM nested-state capability: {0}
+    VcpuCheckNestedState(kvm_ioctls::Error),
     /// Failed to get KVM vcpu nested state: {0}
     VcpuGetNestedState(kvm_ioctls::Error),
     /// Failed to get KVM vcpu regs: {0}
@@ -153,13 +156,14 @@ pub struct KvmVcpu {
     pub fd: VcpuFd,
     /// Vcpu peripherals, such as buses
     pub peripherals: Peripherals,
-    /// The list of MSRs to include in a VM snapshot, in the same order as KVM returned them
-    /// from KVM_GET_MSR_INDEX_LIST
+    /// MSRs to include in snapshots, extended by guest features and captured state.
     msrs_to_save: Vec<u32>,
     /// Size in bytes requiring to hold the dynamically-sized `kvm_xsave` struct.
     ///
     /// `None` if `KVM_CAP_XSAVE2` not supported.
     xsave2_size: Option<usize>,
+    /// Whether KVM supports saving nested state on this VM.
+    nested_state_supported: bool,
 }
 
 /// Vcpu peripherals
@@ -181,18 +185,23 @@ pub struct Peripherals {
 /// leaves the restored vCPU out of VMX operation on the host while the guest
 /// kernel still believes VMX is on (that state lives in restored guest
 /// memory), so the guest never re-executes VMXON and its first VMPTRLD faults.
-/// Mirror QEMU's `nested_state_needed()` and inspect the header GPAs instead.
+/// SVM also stores GIF in the header, even outside nested guest mode.
 fn has_nested_state(state: &KvmNestedStateBuffer) -> bool {
     // Any variable-size data following the header is state (a current
     // VMCS/VMCB always inflates `size`).
     if state.size as usize > std::mem::size_of::<kvm_nested_state>() {
         return true;
     }
-    // The VMXON-only case described above is header-only. SVM has no VMXON
-    // equivalent, so there the header alone carries no state.
-    u32::from(state.format) == KVM_STATE_NESTED_FORMAT_VMX
-        // SAFETY: the format check selects the valid union member.
-        && unsafe { state.hdr.vmx.vmxon_pa != u64::MAX }
+    // Preserve both GIF values for SVM. The absence of GIF_SET means that
+    // interrupts are disabled, not that there is no state to restore.
+    match u32::from(state.format) {
+        KVM_STATE_NESTED_FORMAT_SVM => true,
+        KVM_STATE_NESTED_FORMAT_VMX => {
+            // SAFETY: the format check selects the valid union member.
+            unsafe { state.hdr.vmx.vmxon_pa != u64::MAX }
+        }
+        _ => false,
+    }
 }
 
 impl KvmVcpu {
@@ -208,13 +217,33 @@ impl KvmVcpu {
             .create_vcpu(index.into())
             .map_err(KvmVcpuError::VcpuFd)?;
 
+        let nested_state_supported = match vm.fd().check_extension_int(kvm_ioctls::Cap::NestedState)
+        {
+            ..=-1 => {
+                return Err(KvmVcpuError::VcpuCheckNestedState(
+                    vmm_sys_util::errno::Error::last(),
+                ));
+            }
+            0 => false,
+            _ => true,
+        };
+
         Ok(KvmVcpu {
             index,
             fd: kvm_vcpu,
             peripherals: Default::default(),
             msrs_to_save: vm.msrs_to_save().to_vec(),
             xsave2_size: vm.xsave2_size(),
+            nested_state_supported,
         })
+    }
+
+    fn add_msrs_to_save(&mut self, indices: impl IntoIterator<Item = u32>) {
+        for index in indices {
+            if !self.msrs_to_save.contains(&index) {
+                self.msrs_to_save.push(index);
+            }
+        }
     }
 
     /// Configures a x86_64 specific vcpu for booting Linux and should be called once per vcpu.
@@ -254,7 +283,7 @@ impl KvmVcpu {
 
         // Clone MSR entries that are modified by CPU template from `VcpuConfig`.
         let mut msrs = vcpu_config.cpu_config.msrs.clone();
-        self.msrs_to_save.extend(msrs.keys());
+        self.add_msrs_to_save(msrs.keys().copied());
 
         // Apply MSR modification to comply the linux boot protocol.
         create_boot_msr_entries().into_iter().for_each(|entry| {
@@ -270,7 +299,7 @@ impl KvmVcpu {
         // Since CPUID tells us what features are enabled for the Guest, we can infer
         // the extra MSRs that we need to save based on a dependency map.
         let extra_msrs = cpuid::common::msrs_to_save_by_cpuid(&kvm_cpuid);
-        self.msrs_to_save.extend(extra_msrs);
+        self.add_msrs_to_save(extra_msrs);
 
         // TODO: Some MSRs depend on values of other MSRs. This dependency will need to
         // be implemented.
@@ -622,12 +651,15 @@ impl KvmVcpu {
             None
         });
         let cpuid = self.get_cpuid()?;
-        let mut nested_state = KvmNestedStateBuffer::empty();
-        let _ = self
-            .fd
-            .nested_state(&mut nested_state)
-            .map_err(KvmVcpuError::VcpuGetNestedState)?;
-        let nested_state = has_nested_state(&nested_state).then_some(nested_state);
+        let nested_state = if self.nested_state_supported {
+            let mut state = KvmNestedStateBuffer::empty();
+            self.fd
+                .nested_state(&mut state)
+                .map_err(KvmVcpuError::VcpuGetNestedState)?;
+            has_nested_state(&state).then_some(state)
+        } else {
+            None
+        };
         let saved_msrs = self.get_msr_chunks(self.msrs_to_save.iter().copied())?;
         let vcpu_events = self
             .fd
@@ -685,7 +717,7 @@ impl KvmVcpu {
     }
 
     /// Use provided state to populate KVM internal state.
-    pub fn restore_state(&self, state: &VcpuState) -> Result<(), KvmVcpuError> {
+    pub fn restore_state(&mut self, state: &VcpuState) -> Result<(), KvmVcpuError> {
         // Ordering requirements:
         //
         // KVM_GET_VCPU_EVENTS/KVM_SET_VCPU_EVENTS is unsafe if other vCPUs are
@@ -753,6 +785,16 @@ impl KvmVcpu {
         self.fd
             .set_vcpu_events(&state.vcpu_events)
             .map_err(KvmVcpuError::VcpuSetVcpuEvents)?;
+
+        // Keep captured and CPUID-dependent registers in subsequent snapshots.
+        // The baseline list also covers required registers absent from older snapshots.
+        self.add_msrs_to_save(
+            state
+                .saved_msrs
+                .iter()
+                .flat_map(|msrs| msrs.as_slice().iter().map(|entry| entry.index)),
+        );
+        self.add_msrs_to_save(cpuid::common::msrs_to_save_by_cpuid(&state.cpuid));
 
         self.kvmclock_ctrl();
         Ok(())
@@ -1027,7 +1069,7 @@ mod tests {
 
     #[test]
     fn test_vcpu_cpuid_restore() {
-        let (kvm, _, vcpu) = setup_vcpu(0x10000);
+        let (kvm, _, mut vcpu) = setup_vcpu(0x10000);
         vcpu.fd.set_cpuid2(&kvm.supported_cpuid).unwrap();
 
         // Mutate the CPUID.
@@ -1045,7 +1087,7 @@ mod tests {
         drop(vcpu);
 
         // Restore the state into a new vcpu.
-        let (_, _vm, vcpu) = setup_vcpu(0x10000);
+        let (_, _vm, mut vcpu) = setup_vcpu(0x10000);
         let result2 = vcpu.restore_state(&state);
         assert!(result2.is_ok(), "{}", result2.unwrap_err());
 
@@ -1060,6 +1102,66 @@ mod tests {
             })
             .unwrap();
         assert!(leaf3.result.eax == 0x1234_5678);
+    }
+
+    #[test]
+    fn test_msr_values_survive_repeated_restore() {
+        use crate::arch::x86_64::generated::msr_index::{
+            MSR_AMD64_VIRT_SPEC_CTRL, MSR_IA32_MC0_CTL, MSR_VM_CR, MSR_VM_HSAVE_PA,
+        };
+
+        let (kvm, vm, mut vcpu) = setup_vcpu(0x10000);
+        let config = create_vcpu_config(&kvm, &vcpu, &CustomCpuTemplate::default()).unwrap();
+        vcpu.configure(
+            vm.guest_memory(),
+            EntryPoint {
+                entry_addr: GuestAddress(0),
+                protocol: BootProtocol::LinuxBoot,
+            },
+            &config,
+        )
+        .unwrap();
+        let mut expected = BTreeMap::from([(MSR_IA32_MC0_CTL, u64::MAX)]);
+        if kvm
+            .fd
+            .get_msr_index_list()
+            .unwrap()
+            .as_slice()
+            .contains(&MSR_AMD64_VIRT_SPEC_CTRL)
+        {
+            expected.insert(MSR_AMD64_VIRT_SPEC_CTRL, 1 << 2);
+        }
+        if cpuid::common::msrs_to_save_by_cpuid(&vcpu.get_cpuid().unwrap()).contains(&MSR_VM_CR) {
+            expected.insert(MSR_VM_CR, 1);
+            expected.insert(MSR_VM_HSAVE_PA, 0x1000);
+        }
+        let entries: Vec<_> = expected
+            .iter()
+            .map(|(&index, &data)| kvm_bindings::kvm_msr_entry {
+                index,
+                data,
+                ..Default::default()
+            })
+            .collect();
+        crate::arch::x86_64::msr::set_msrs(&vcpu.fd, &entries).unwrap();
+        let mut state = vcpu.save_state().unwrap();
+        for _ in 0..2 {
+            let (_, _vm, mut restored) = setup_vcpu(0x10000);
+            restored.restore_state(&state).unwrap();
+            state = restored.save_state().unwrap();
+            let saved: BTreeMap<_, _> = state
+                .saved_msrs
+                .iter()
+                .flat_map(|msrs| {
+                    msrs.as_slice()
+                        .iter()
+                        .map(|entry| (entry.index, entry.data))
+                })
+                .collect();
+            for (&index, &value) in &expected {
+                assert_eq!(saved.get(&index), Some(&value), "MSR {index:#x}");
+            }
+        }
     }
 
     #[test]
@@ -1199,6 +1301,36 @@ mod tests {
             // overflow
             assert!(vcpu.is_tsc_scaling_required(30_000_000).unwrap());
         }
+    }
+
+    #[test]
+    fn test_has_nested_state_header() {
+        use kvm_bindings::{KVM_STATE_NESTED_FORMAT_SVM, KVM_STATE_NESTED_GIF_SET};
+
+        let mut state = KvmNestedStateBuffer::empty();
+        state.size = std::mem::size_of::<kvm_nested_state>() as u32;
+        state.format = KVM_STATE_NESTED_FORMAT_SVM as u16;
+        for flags in [0, KVM_STATE_NESTED_GIF_SET as u16] {
+            state.flags = flags;
+            assert!(has_nested_state(&state), "SVM GIF must survive snapshots");
+        }
+
+        state.format = KVM_STATE_NESTED_FORMAT_VMX as u16;
+        state.flags = 0;
+        state.hdr.vmx.vmxon_pa = u64::MAX;
+        assert!(!has_nested_state(&state));
+        state.hdr.vmx.vmxon_pa = 0x1000;
+        assert!(has_nested_state(&state));
+        state.hdr.vmx.vmxon_pa = u64::MAX;
+        state.size += 1;
+        assert!(has_nested_state(&state));
+    }
+
+    #[test]
+    fn test_save_state_without_nested_capability() {
+        let (_kvm, _vm, mut vcpu) = setup_vcpu(0x1000);
+        vcpu.nested_state_supported = false;
+        assert!(vcpu.save_state().unwrap().nested_state.is_none());
     }
 
     #[test]

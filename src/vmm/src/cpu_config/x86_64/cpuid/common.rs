@@ -6,7 +6,7 @@ use crate::arch::x86_64::generated::msr_index::{
     MSR_IA32_BNDCFGS, MSR_IA32_CR_PAT, MSR_MTRRdefType, MSR_MTRRfix4K_C0000, MSR_MTRRfix4K_C8000,
     MSR_MTRRfix4K_D0000, MSR_MTRRfix4K_D8000, MSR_MTRRfix4K_E0000, MSR_MTRRfix4K_E8000,
     MSR_MTRRfix4K_F0000, MSR_MTRRfix4K_F8000, MSR_MTRRfix16K_80000, MSR_MTRRfix16K_A0000,
-    MSR_MTRRfix64K_00000,
+    MSR_MTRRfix64K_00000, MSR_VM_CR, MSR_VM_HSAVE_PA,
 };
 
 /// Error type for [`get_cpuid`].
@@ -67,6 +67,9 @@ pub(crate) fn msrs_to_save_by_cpuid(cpuid: &kvm_bindings::CpuId) -> Vec<u32> {
     /// Memory Type Range Registers
     const MTRR_BITINDEX: u32 = 12;
 
+    /// Secure Virtual Machine
+    const SVM_BITINDEX: u32 = 2;
+
     /// Memory Check Exception
     const MCE_BITINDEX: u32 = 7;
 
@@ -98,6 +101,15 @@ pub(crate) fn msrs_to_save_by_cpuid(cpuid: &kvm_bindings::CpuId) -> Vec<u32> {
             }
         };
     }
+
+    // SVM state is not fully enumerated by KVM_GET_MSR_INDEX_LIST.
+    cpuid_msr_dep!(
+        0x8000_0001,
+        0,
+        ecx,
+        SVM_BITINDEX,
+        [MSR_VM_CR, MSR_VM_HSAVE_PA]
+    );
 
     // TODO: Add more dependencies.
     cpuid_msr_dep!(0x7, 0, ebx, MPX_BITINDEX, [MSR_IA32_BNDCFGS]);
@@ -141,6 +153,21 @@ pub(crate) fn msrs_to_save_by_cpuid(cpuid: &kvm_bindings::CpuId) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_svm_msr_dependencies() {
+        let mut cpuid = kvm_bindings::CpuId::new(1).unwrap();
+        assert!(msrs_to_save_by_cpuid(&cpuid).is_empty());
+        cpuid.as_mut_slice()[0].function = 1;
+        cpuid.as_mut_slice()[0].edx = 1 << 12;
+        let msrs = msrs_to_save_by_cpuid(&cpuid);
+        assert!(!msrs.contains(&MSR_VM_CR));
+        assert!(!msrs.contains(&MSR_VM_HSAVE_PA));
+        cpuid.as_mut_slice()[0].function = 0x8000_0001;
+        assert!(msrs_to_save_by_cpuid(&cpuid).is_empty());
+        cpuid.as_mut_slice()[0].ecx = 1 << 2;
+        assert_eq!(msrs_to_save_by_cpuid(&cpuid), [MSR_VM_CR, MSR_VM_HSAVE_PA]);
+    }
 
     #[test]
     fn get_cpuid_unsupported_leaf() {

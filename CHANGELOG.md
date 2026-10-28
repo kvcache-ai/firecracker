@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.15.1-patch-v2]
+
+### Added
+
+- x86_64 nested KVM state preservation across snapshots.
+- Legacy v9 snapshot loading on x86_64 and aarch64; new snapshots use v1000.
+
+### Fixed
+
+- Retain the x86_64 MSR save set across repeated snapshot restores.
+- Save AMD SVM VM_CR and HSAVE_PA when the guest exposes SVM.
+- Preserve the guest VIRT_SPEC_CTRL setting across snapshot restore.
+- Preserve IA32_XSS across x86_64 snapshot restore for guests using supervisor XSTATE.
+
 ## [1.15.1]
 
 ### Added

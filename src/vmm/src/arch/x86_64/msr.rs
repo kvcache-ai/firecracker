@@ -235,9 +235,13 @@ static SERIALIZABLE_MSR_RANGES: &[MsrRange] = &[
     MSR_RANGE!(MSR_MISC_FEATURES_ENABLES),
     MSR_RANGE!(MSR_K7_HWCR),
     MSR_RANGE!(MSR_VM_HSAVE_PA),
+    MSR_RANGE!(MSR_AMD64_VIRT_SPEC_CTRL),
     MSR_RANGE!(MSR_KVM_POLL_CONTROL),
     MSR_RANGE!(MSR_KVM_ASYNC_PF_INT),
     MSR_RANGE!(MSR_IA32_TSX_CTRL),
+    // IA32_XSS controls which supervisor XSTATE components are enabled. Without it, the guest
+    // kernel's XRSTORS of process FPU state containing CET/PT supervisor components triggers #GP.
+    MSR_RANGE!(MSR_IA32_XSS),
 ];
 
 /// Specifies whether a particular MSR should be included in vcpu serialization.

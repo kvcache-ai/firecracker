@@ -4,8 +4,7 @@
 use std::path::PathBuf;
 
 use clap::Subcommand;
-use vmm::persist::MicrovmState;
-use vmm::snapshot::Snapshot;
+use vmm::snapshot::LoadedMicrovmSnapshot;
 
 use crate::utils::*;
 
@@ -50,19 +49,19 @@ pub fn info_vmstate_command(command: InfoVmStateSubCommand) -> Result<(), InfoVm
 
 fn info(
     vmstate_path: &PathBuf,
-    f: impl Fn(&Snapshot<MicrovmState>) -> Result<(), InfoVmStateError>,
+    f: impl Fn(&LoadedMicrovmSnapshot) -> Result<(), InfoVmStateError>,
 ) -> Result<(), InfoVmStateError> {
     let snapshot = open_vmstate(vmstate_path)?;
     f(&snapshot)?;
     Ok(())
 }
 
-fn info_version(snapshot: &Snapshot<MicrovmState>) -> Result<(), InfoVmStateError> {
-    println!("v{}", snapshot.version());
+fn info_version(snapshot: &LoadedMicrovmSnapshot) -> Result<(), InfoVmStateError> {
+    println!("v{}", snapshot.format_version);
     Ok(())
 }
 
-fn info_vcpu_states(snapshot: &Snapshot<MicrovmState>) -> Result<(), InfoVmStateError> {
+fn info_vcpu_states(snapshot: &LoadedMicrovmSnapshot) -> Result<(), InfoVmStateError> {
     for (i, state) in snapshot.data.vcpu_states.iter().enumerate() {
         println!("vcpu {i}:");
         println!("{state:#?}");
@@ -70,7 +69,7 @@ fn info_vcpu_states(snapshot: &Snapshot<MicrovmState>) -> Result<(), InfoVmState
     Ok(())
 }
 
-fn info_vmstate(snapshot: &Snapshot<MicrovmState>) -> Result<(), InfoVmStateError> {
+fn info_vmstate(snapshot: &LoadedMicrovmSnapshot) -> Result<(), InfoVmStateError> {
     println!("{:#?}", snapshot.data);
     Ok(())
 }
