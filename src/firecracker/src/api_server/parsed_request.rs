@@ -25,7 +25,9 @@ use super::request::metrics::parse_put_metrics;
 use super::request::mmds::{parse_get_mmds, parse_patch_mmds, parse_put_mmds};
 use super::request::net::{parse_patch_net, parse_put_net};
 use super::request::pmem::parse_put_pmem;
-use super::request::snapshot::{parse_patch_vm_state, parse_put_snapshot};
+use super::request::snapshot::{
+    parse_patch_vm_state, parse_put_clear_dirty_memory, parse_put_snapshot,
+};
 use super::request::version::parse_get_version;
 use super::request::vsock::parse_put_vsock;
 use crate::api_server::request::hotplug::memory::{
@@ -80,6 +82,11 @@ impl TryFrom<&Request> for ParsedRequest {
         let path = path_tokens.next().unwrap_or("");
 
         match (request.method(), path, request.body.as_ref()) {
+            (method, _, _)
+                if request_uri == "/vm/dirty-memory-ranges/clear" && method != Method::Put =>
+            {
+                Err(RequestError::InvalidPathMethod(request_uri, method))
+            }
             (Method::Get, "", None) => parse_get_instance_info(),
             (Method::Get, "balloon", None) => parse_get_balloon(path_tokens),
             (Method::Get, "version", None) => parse_get_version(),
@@ -102,6 +109,9 @@ impl TryFrom<&Request> for ParsedRequest {
                 parse_get_memory_hotplug()
             }
             (Method::Get, _, Some(_)) => method_to_error(Method::Get),
+            (Method::Put, "vm", Some(body)) if request_uri == "/vm/dirty-memory-ranges/clear" => {
+                parse_put_clear_dirty_memory(body)
+            }
             (Method::Put, "actions", Some(body)) => parse_put_actions(body),
             (Method::Put, "balloon", Some(body)) => parse_put_balloon(body),
             (Method::Put, "boot-source", Some(body)) => parse_put_boot_source(body),
@@ -778,6 +788,59 @@ pub mod tests {
             vmm_action_from_request(parsed),
             VmmAction::GetGuestMemoryRegions
         );
+    }
+
+    fn parse_clear_request(
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+    ) -> Result<ParsedRequest, RequestError> {
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        let mut connection = HttpConnection::new(receiver);
+        sender
+            .write_all(http_request(method, path, body).as_bytes())
+            .unwrap();
+        connection.try_read().unwrap();
+        ParsedRequest::try_from(&connection.pop_parsed_request().unwrap())
+    }
+
+    #[test]
+    fn test_try_from_clear_dirty_memory() {
+        assert_eq!(
+            vmm_action_from_request(
+                parse_clear_request("PUT", "/vm/dirty-memory-ranges/clear", Some("{}")).unwrap()
+            ),
+            VmmAction::ClearDirtyMemory
+        );
+        let response = ParsedRequest::convert_to_response(&Ok(VmmData::Empty));
+        assert_eq!(response.status(), StatusCode::NoContent);
+        assert!(response.body().is_none());
+    }
+
+    #[test]
+    fn test_try_from_clear_dirty_memory_invalid_requests() {
+        let cases = [
+            ("PUT", "/vm/dirty-memory-ranges/clear", None),
+            ("PUT", "/vm/dirty-memory-ranges/clear/extra", Some("{}")),
+            ("PUT", "/vm/dirty-memory-ranges/clear/", Some("{}")),
+            ("PUT", "//vm/dirty-memory-ranges/clear", Some("{}")),
+            ("PUT", "/vm/dirty-memory-ranges", Some("{}")),
+        ];
+        for (method, path, body) in cases {
+            assert!(
+                parse_clear_request(method, path, body).is_err(),
+                "{method} {path} {body:?}"
+            );
+        }
+        for (method, body) in [("GET", None), ("PATCH", Some(r#"{"state":"Resumed"}"#))] {
+            assert!(
+                matches!(
+                    parse_clear_request(method, "/vm/dirty-memory-ranges/clear", body),
+                    Err(RequestError::InvalidPathMethod(_, _))
+                ),
+                "{method} {body:?}"
+            );
+        }
     }
 
     #[test]

@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Add `PUT /vm/dirty-memory-ranges/clear` to clear committed dirty records while
+  paused with dirty tracking enabled, or succeed as a no-op when tracking is
+  disabled.
+
 ## [1.15.1]
 
 ### Added
