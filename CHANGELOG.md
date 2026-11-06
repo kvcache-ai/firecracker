@@ -10,11 +10,20 @@ and this project adheres to
 
 ### Added
 
-- Release the existing paused-only `PUT /vm/pre-fault-memory` API from PR #18.
+- x86_64 nested KVM state preservation across snapshots.
+- Legacy v9 snapshot loading on x86_64 and aarch64; new snapshots use v1000.
+- Paused-only `PUT /vm/pre-fault-memory` API from PR #18.
   On x86_64 with `KVM_CAP_PRE_FAULT_MEMORY`, it distributes validated,
   page-aligned guest-physical ranges across the available vCPUs using
-  `KVM_PRE_FAULT_MEMORY`; aarch64 remains unsupported. This release does not
-  change startup, restore behavior, or the snapshot serialization/data format.
+  `KVM_PRE_FAULT_MEMORY`; aarch64 remains unsupported. The pre-fault API does
+  not change default startup or snapshot-restore behavior.
+
+### Fixed
+
+- Retain the x86_64 MSR save set across repeated snapshot restores.
+- Save AMD SVM VM_CR and HSAVE_PA when the guest exposes SVM.
+- Preserve the guest VIRT_SPEC_CTRL setting across snapshot restore.
+- Preserve IA32_XSS across x86_64 snapshot restore for guests using supervisor XSTATE.
 
 ## [1.15.1]
 
