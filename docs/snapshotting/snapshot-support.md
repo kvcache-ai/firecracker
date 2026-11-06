@@ -291,6 +291,51 @@ Details about the required and optional fields can be found in the
 - The separate block device file components of the snapshot have to be handled
   by the user.
 
+#### External memory export and explicit dirty record clearing
+
+`PUT /vm/dirty-memory-ranges/clear` requires a started, paused VM and body `{}`.
+Success returns `204 No Content`. With dirty tracking enabled, it clears current
+dirty records without changing guest bytes or pause state; repeated calls are
+allowed while quiescent. Activated MMIO/PCI virtio queue pages remain
+conservatively dirty, so the next GET need not be empty.
+
+With dirty tracking disabled, CLEAR returns `204` without reading KVM logs,
+scanning `mincore`, resetting bitmaps or changing guest memory. GET continues to
+use `mincore` residency information; CLEAR does not establish a new dirty
+baseline or make subsequent exports contain only new writes.
+
+With dirty tracking enabled, keep one pause window for the entire export
+protocol:
+
+1. Save CPU/device state with a state-only `PUT /snapshot/create` (omit
+   `mem_file_path`) to prepare devices.
+1. Build an initial full memory baseline using `GET /vm/guest-memory-regions`;
+   subsequently export `GET /vm/dirty-memory-ranges`. Read host addresses into
+   `image_offset` positions, checking short reads and preserving explicit zero
+   writes. Image offsets omit GPA holes. GET preserves logical dirty records.
+1. Commit the memory image, matching VM/disk state and metadata.
+1. Send CLEAR, then resume only after success.
+
+Coordinate external and asynchronous memory writers throughout this window;
+pausing vCPUs and holding the VMM lock alone do not stop every writer. CLEAR
+neither prepares devices nor verifies the commit. It requires no preceding GET
+or generation token: resuming before CLEAR can discard uncommitted changes. Do
+not CLEAR if export or commit fails.
+
+Invalid requests and unmet preconditions are rejected before clearing. A KVM
+slot failure may partially clear logs. There is no rollback or safe retry: treat
+the instance as unreliable and recover the last committed snapshot in a
+replacement instance.
+
+**Native snapshots and external exports share one global dirty baseline.** For
+example, external changes A applied to S0 produce S1. After CLEAR and changes B,
+apply the next native Diff to S1; applying it to S0 would omit A. Retain S1 or
+all layers needed to reconstruct it. CLEAR does not select Full/Diff types or
+change snapshot formats or existing GET behavior.
+
+This additive endpoint requires a minor version increase when released, per the
+[API change runbook](../api-change-runbook.md).
+
 #### Creating diff snapshots
 
 For creating a diff snapshot, you should use the same API command, but with

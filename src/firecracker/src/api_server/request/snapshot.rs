@@ -43,6 +43,17 @@ pub(crate) fn parse_put_snapshot(
     }
 }
 
+pub(crate) fn parse_put_clear_dirty_memory(body: &Body) -> Result<ParsedRequest, RequestError> {
+    let value: serde_json::Value = serde_json::from_slice(body.raw())?;
+    if !matches!(value, serde_json::Value::Object(ref object) if object.is_empty()) {
+        return Err(RequestError::Generic(
+            StatusCode::BadRequest,
+            "Clearing dirty memory requires an empty JSON object.".to_string(),
+        ));
+    }
+    Ok(ParsedRequest::new_sync(VmmAction::ClearDirtyMemory))
+}
+
 pub(crate) fn parse_patch_vm_state(body: &Body) -> Result<ParsedRequest, RequestError> {
     let vm = serde_json::from_slice::<Vm>(body.raw())?;
 
@@ -130,6 +141,32 @@ mod tests {
 
     use super::*;
     use crate::api_server::parsed_request::tests::{depr_action_from_req, vmm_action_from_request};
+
+    #[test]
+    fn test_parse_put_clear_dirty_memory() {
+        for body in ["{}", " { } "] {
+            assert_eq!(
+                vmm_action_from_request(parse_put_clear_dirty_memory(&Body::new(body)).unwrap()),
+                VmmAction::ClearDirtyMemory
+            );
+        }
+        for body in [
+            "",
+            "{",
+            "null",
+            "[]",
+            "[{}]",
+            "true",
+            "1",
+            "\"clear\"",
+            "{\"force\":true}",
+        ] {
+            assert!(
+                parse_put_clear_dirty_memory(&Body::new(body)).is_err(),
+                "{body}"
+            );
+        }
+    }
 
     #[test]
     fn test_parse_put_snapshot() {
