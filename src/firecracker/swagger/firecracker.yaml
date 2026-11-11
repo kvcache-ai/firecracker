@@ -881,6 +881,41 @@ paths:
           schema:
             $ref: "#/definitions/Error"
 
+  /vm/dirty-memory-ranges/clear:
+    put:
+      summary: Clears committed dirty memory records.
+      description: >-
+        Send an empty JSON object to a started, paused VM. With dirty
+        tracking disabled, returns 204 as a no-op without reading KVM logs or
+        scanning mincore; GET retains its residency-based behavior and no new
+        dirty baseline is established. With dirty tracking enabled, clears the
+        shared dirty baseline after snapshot commit;
+        guest bytes and pause state are unchanged. Activated virtio queue pages
+        remain dirty. Invalid requests are rejected before clearing. KVM failure
+        may partially clear logs without rollback: recover from the last committed
+        snapshot in a replacement instance. See snapshot-support.md for writer
+        coordination, commit ordering and the shared native/external baseline.
+      operationId: clearDirtyMemory
+      parameters:
+        - name: body
+          in: body
+          required: true
+          schema:
+            type: object
+            additionalProperties: false
+            maxProperties: 0
+      responses:
+        204:
+          description: Records cleared, or no-op when dirty tracking is disabled; VM remains paused. No response body.
+        400:
+          description: Invalid request, unmet precondition or dirty log read failure
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error
+          schema:
+            $ref: "#/definitions/Error"
+
   /vm/dirty-memory-ranges:
     get:
       summary: Returns dirty guest memory ranges.
@@ -1613,8 +1648,10 @@ definitions:
         description:
           Enable dirty page tracking. If this is enabled, then incremental guest memory
           snapshots can be created. These belong to diff snapshots, which contain, besides
-          the microVM state, only the memory dirtied since a previous snapshot. Full snapshots
-          each contain a full copy of the guest memory.
+          the microVM state, pages dirtied since the current baseline, including pages
+          marked dirty by emulated devices. Saving a native memory snapshot or clearing
+          dirty records advances the baseline; saving only VM state does not. Full
+          snapshots each contain a full copy of the guest memory.
         default: false
       vcpu_count:
         type: integer

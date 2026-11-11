@@ -291,6 +291,51 @@ Details about the required and optional fields can be found in the
 - The separate block device file components of the snapshot have to be handled
   by the user.
 
+#### External memory export and explicit dirty record clearing
+
+Send `PUT /vm/dirty-memory-ranges/clear` with body `{}` to a started, paused VM.
+Success returns `204 No Content`. With dirty tracking enabled, it clears current
+dirty records without changing guest bytes or pause state; repeated calls are
+allowed while quiescent. Activated MMIO/PCI virtio queue pages remain
+conservatively dirty, so the next GET need not be empty.
+
+With dirty tracking disabled, CLEAR returns `204` without reading KVM logs,
+scanning `mincore`, resetting bitmaps or changing guest memory. GET continues to
+use `mincore` residency information; CLEAR does not establish a new dirty
+baseline or make subsequent exports contain only new writes.
+
+With dirty tracking enabled, keep one pause window for the entire export
+protocol:
+
+1. Save CPU/device state with a state-only `PUT /snapshot/create` (omit
+   `mem_file_path`) to prepare devices.
+1. Build an initial full memory baseline using `GET /vm/guest-memory-regions`;
+   subsequently export `GET /vm/dirty-memory-ranges`. Read host addresses into
+   `image_offset` positions, checking short reads and preserving explicit zero
+   writes. Image offsets omit GPA holes. GET preserves logical dirty records.
+1. Commit the memory image, matching VM/disk state and metadata.
+1. Send CLEAR, then resume only after success.
+
+Coordinate external and asynchronous memory writers throughout this window;
+pausing vCPUs and holding the VMM lock alone do not stop every writer. CLEAR
+neither prepares devices nor verifies the commit. It requires no preceding GET
+or generation token: resuming before CLEAR can discard uncommitted changes. Do
+not CLEAR if export or commit fails.
+
+Invalid requests and unmet preconditions are rejected before clearing. A KVM
+slot failure may partially clear logs. There is no rollback or safe retry: treat
+the instance as unreliable and recover the last committed snapshot in a
+replacement instance.
+
+**Native snapshots and external exports share one global dirty baseline.** For
+example, external changes A applied to S0 produce S1. After CLEAR and changes B,
+apply the next native Diff to S1; applying it to S0 would omit A. Retain S1 or
+all layers needed to reconstruct it. CLEAR does not select Full/Diff types or
+change snapshot formats or existing GET behavior.
+
+This additive endpoint requires a minor version increase when released, per the
+[API change runbook](../api-change-runbook.md).
+
 #### Creating diff snapshots
 
 For creating a diff snapshot, you should use the same API command, but with
@@ -317,14 +362,16 @@ For creating a diff snapshot, you should use the same API command, but with
 Diff snapshots come in two flavors. If `track_dirty_pages` was set to `true`
 when configuring the `/machine-config` resource or when restoring from a
 snapshot via `/snapshot/load`, Firecracker will use KVM's dirty page log runtime
-functionality to ensure the diff snapshot only contains exactly pages that were
-written to since boot / snapshot restoration. If `track_dirty_pages` is not
-enabled, Firecracker uses the [`mincore(2)`][man mincore] syscall to determine
-which pages to include in the snapshot. As such, this mode of snapshot taking
-will only work _if swap is disabled_, as mincore does not consider pages written
-to swap to be "in core". This potentially results in bigger memory files
-(although they are still sparse), but avoids the runtime overhead of dirty page
-logging.
+functionality to include pages dirtied since the current baseline, together with
+pages marked dirty by emulated devices. Saving a native memory snapshot or
+successfully calling CLEAR advances this baseline; a state-only snapshot does
+not. Apply each Diff to the complete memory image represented by its baseline.
+If `track_dirty_pages` is not enabled, Firecracker uses the
+[`mincore(2)`][man mincore] syscall to determine which pages to include in the
+snapshot. As such, this mode of snapshot taking will only work _if swap is
+disabled_, as mincore does not consider pages written to swap to be "in core".
+This potentially results in bigger memory files (although they are still
+sparse), but avoids the runtime overhead of dirty page logging.
 
 > [!NOTE]
 >
@@ -465,10 +512,10 @@ to the new Firecracker process as they were to the original one.
 - _on success_:
   - The complete microVM state is loaded from snapshot into the current
     Firecracker process.
-  - It then resets the dirtied page bitmap and marks all pages clean (from a
-    diff snapshot point of view).
-  - The loaded microVM is now in the `Paused` state, so it needs to be resumed
-    for it to run.
+  - The loaded memory image establishes the baseline for subsequent Diffs.
+    Device restoration can mark pages dirty, including activated virtio queue
+    pages.
+  - The loaded microVM is in the `Paused` state unless `resume_vm` is set.
   - The memory file (pointed by `backend_path` when using `File` backend type,
     or pointed by `mem_file_path`) **must** be considered immutable from
     Firecracker and host point of view. It backs the guest OS memory for read

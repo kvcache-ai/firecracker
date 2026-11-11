@@ -1,7 +1,7 @@
 // Copyright 2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use serde::de::Error as DeserializeError;
+use serde::{Deserialize, de::Error as DeserializeError};
 use vmm::logger::{IncMetric, METRICS};
 use vmm::rpc_interface::VmmAction;
 use vmm::vmm_config::snapshot::{
@@ -23,6 +23,10 @@ pub const MISSING_FIELD: &str =
 pub const TOO_MANY_FIELDS: &str =
     "too many fields: either `mem_backend` or `mem_file_path` exclusively is required";
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClearDirtyMemoryRequest {}
+
 pub(crate) fn parse_put_snapshot(
     body: &Body,
     request_type_from_path: Option<&str>,
@@ -41,6 +45,11 @@ pub(crate) fn parse_put_snapshot(
             "Missing snapshot operation type.".to_string(),
         )),
     }
+}
+
+pub(crate) fn parse_put_clear_dirty_memory(body: &Body) -> Result<ParsedRequest, RequestError> {
+    serde_json::from_slice::<ClearDirtyMemoryRequest>(body.raw())?;
+    Ok(ParsedRequest::new_sync(VmmAction::ClearDirtyMemory))
 }
 
 pub(crate) fn parse_patch_vm_state(body: &Body) -> Result<ParsedRequest, RequestError> {
@@ -130,6 +139,17 @@ mod tests {
 
     use super::*;
     use crate::api_server::parsed_request::tests::{depr_action_from_req, vmm_action_from_request};
+
+    #[test]
+    fn test_parse_put_clear_dirty_memory() {
+        parse_put_clear_dirty_memory(&Body::new("invalid_body")).unwrap_err();
+        parse_put_clear_dirty_memory(&Body::new(r#"{"force":true}"#)).unwrap_err();
+
+        assert_eq!(
+            vmm_action_from_request(parse_put_clear_dirty_memory(&Body::new("{}")).unwrap()),
+            VmmAction::ClearDirtyMemory
+        );
+    }
 
     #[test]
     fn test_parse_put_snapshot() {

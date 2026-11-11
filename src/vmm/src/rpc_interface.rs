@@ -45,7 +45,9 @@ use crate::vmm_config::serial::SerialConfig;
 use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, SnapshotType};
 use crate::vmm_config::vsock::{VsockConfigError, VsockDeviceConfig};
 use crate::vmm_config::{self, RateLimiterUpdate};
-use crate::vstate::memory::{DirtyMemoryRanges, GuestMemory};
+use crate::vstate::memory::{
+    DirtyMemoryRanges, GuestMemory, GuestMemoryExtension, GuestMemoryRegion,
+};
 use crate::vstate::prefault::{PreFaultMemoryError, PreFaultMemoryRequest};
 use crate::vstate::vm::VmError;
 
@@ -73,6 +75,8 @@ pub enum VmmAction {
     GetBalloonStats,
     /// Get complete microVM configuration in JSON format.
     GetFullVmConfig,
+    /// Clear committed dirty memory records while paused. Post-boot only.
+    ClearDirtyMemory,
     /// Get dirty guest memory ranges. Post-boot only.
     GetDirtyMemoryRanges,
     /// Get guest memory region mappings. Post-boot only.
@@ -507,6 +511,7 @@ impl<'a> PrebootApiController<'a> {
             CreateSnapshot(_)
             | FlushMetrics
             | GetDirtyMemoryRanges
+            | ClearDirtyMemory
             | GetGuestMemoryRegions
             | Pause
             | Resume
@@ -722,6 +727,7 @@ impl RuntimeApiController {
                 self.vmm.lock().expect("Poisoned lock").full_config(),
             )),
             GetDirtyMemoryRanges => self.get_dirty_memory_ranges(),
+            ClearDirtyMemory => self.clear_dirty_memory(),
             GetGuestMemoryRegions => self.get_guest_memory_regions(),
             PreFaultMemory(request) => self.pre_fault_memory(request),
             GetMemoryHotplugStatus => self
@@ -979,6 +985,36 @@ impl RuntimeApiController {
         Ok(VmmData::DirtyMemoryRanges(ranges))
     }
 
+    /// Clear historical dirty records after an external snapshot has been committed.
+    /// The caller must keep the VM paused and coordinate any other memory writers.
+    /// Succeeds without clearing when dirty page tracking is disabled.
+    fn clear_dirty_memory(&self) -> Result<VmmData, VmmActionError> {
+        let locked_vmm = self.vmm.lock().expect("Poisoned lock");
+        if locked_vmm.instance_info.state != crate::vmm_config::instance_info::VmState::Paused {
+            return Err(VmmActionError::NotSupported(
+                "Clearing dirty memory requires a paused microVM.".to_string(),
+            ));
+        }
+        if !locked_vmm.machine_config.track_dirty_pages {
+            return Ok(VmmData::Empty);
+        }
+        let memory = locked_vmm.vm.guest_memory();
+        if memory.iter().any(|region| region.bitmap().is_none()) {
+            return Err(VmmActionError::NotSupported(
+                "Clearing dirty memory requires dirty page tracking.".to_string(),
+            ));
+        }
+
+        // Slot failures can leave partially cleared KVM logs. Propagate the error;
+        // the caller must treat the instance as unreliable.
+        let _ = locked_vmm.vm.get_dirty_bitmap()?;
+        memory.reset_dirty();
+        locked_vmm
+            .device_manager
+            .mark_virtio_queue_memory_dirty(memory);
+        Ok(VmmData::Empty)
+    }
+
     /// Updates block device properties:
     ///  - path of the host file backing the emulated block device, update the disk image on the
     ///    device and its virtio configuration
@@ -1215,6 +1251,7 @@ mod tests {
         check_unsupported(preboot_request(VmmAction::Resume));
         check_unsupported(preboot_request(VmmAction::GetBalloonStats));
         check_unsupported(preboot_request(VmmAction::GetDirtyMemoryRanges));
+        check_unsupported(preboot_request(VmmAction::ClearDirtyMemory));
         check_unsupported(preboot_request(VmmAction::GetGuestMemoryRegions));
         let pre_fault_result = preboot_request(VmmAction::PreFaultMemory(
             PreFaultMemoryRequest {
@@ -1302,6 +1339,221 @@ mod tests {
                 }
             }
             other => panic!("Expected GuestMemoryRegions, got {:?}", other),
+        }
+    }
+
+    fn clear_dirty_memory_controller(tracking: bool, region_size: usize) -> RuntimeApiController {
+        use crate::vstate::memory::{GuestAddress, anonymous};
+        let mut vmm = default_vmm();
+        let (_, mut vm) = crate::vstate::vm::tests::setup_vm();
+        let regions = anonymous(
+            [0, 0x20000, 0x40000]
+                .into_iter()
+                .map(|addr| (GuestAddress(addr), region_size)),
+            tracking,
+            Default::default(),
+        )
+        .unwrap();
+        vm.register_dram_memory_regions(regions).unwrap();
+        vmm.vm = Arc::new(vm);
+        vmm.instance_info.state = crate::vmm_config::instance_info::VmState::Paused;
+        vmm.machine_config.track_dirty_pages = tracking;
+        RuntimeApiController::new(Arc::new(Mutex::new(vmm)))
+    }
+
+    #[test]
+    fn test_clear_dirty_memory_preconditions() {
+        use crate::vmm_config::instance_info::VmState;
+        use crate::vstate::memory::{Bitmap, GuestAddress};
+        let mut controller = clear_dirty_memory_controller(true, 0x2000);
+        let memory = controller.vmm.lock().unwrap().vm.guest_memory().clone();
+        for state in [VmState::Running, VmState::NotStarted] {
+            {
+                let mut vmm = controller.vmm.lock().unwrap();
+                vmm.instance_info.state = state;
+                memory.mark_dirty(GuestAddress(0), 1);
+            }
+            assert!(
+                controller
+                    .handle_request(VmmAction::ClearDirtyMemory)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("paused")
+            );
+            assert!(memory.iter().next().unwrap().bitmap().dirty_at(0));
+        }
+        {
+            let mut vmm = controller.vmm.lock().unwrap();
+            vmm.instance_info.state = VmState::Paused;
+            vmm.machine_config.track_dirty_pages = false;
+            // A no-op must not read KVM logs or reset retained Firecracker bits.
+            let slot = memory
+                .iter()
+                .next()
+                .unwrap()
+                .plugged_slots()
+                .next()
+                .unwrap();
+            let mut registration: kvm_bindings::kvm_userspace_memory_region = (&slot).into();
+            registration.memory_size = 0;
+            vmm.vm.set_user_memory_region(registration).unwrap();
+        }
+        assert_eq!(
+            controller
+                .handle_request(VmmAction::ClearDirtyMemory)
+                .unwrap(),
+            VmmData::Empty
+        );
+        assert!(memory.iter().next().unwrap().bitmap().dirty_at(0));
+
+        // Even a mismatched config must not permit the mincore fallback.
+        let mut controller = clear_dirty_memory_controller(false, 0x2000);
+        controller
+            .vmm
+            .lock()
+            .unwrap()
+            .machine_config
+            .track_dirty_pages = true;
+        assert!(
+            controller
+                .handle_request(VmmAction::ClearDirtyMemory)
+                .unwrap_err()
+                .to_string()
+                .contains("tracking")
+        );
+    }
+
+    #[test]
+    fn test_clear_dirty_memory_repeat_preserves_bytes() {
+        use crate::vstate::memory::{Bytes, GuestAddress};
+        let mut controller = clear_dirty_memory_controller(true, 0x2000);
+        let memory = controller.vmm.lock().unwrap().vm.guest_memory().clone();
+        memory
+            .write_slice(&[0x5a; 0x1000], GuestAddress(0))
+            .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                controller
+                    .handle_request(VmmAction::ClearDirtyMemory)
+                    .unwrap(),
+                VmmData::Empty
+            );
+            let VmmData::DirtyMemoryRanges(ranges) = controller
+                .handle_request(VmmAction::GetDirtyMemoryRanges)
+                .unwrap()
+            else {
+                panic!("expected ranges")
+            };
+            assert!(ranges.ranges.is_empty()); // This test has no activated devices.
+            let vmm = controller.vmm.lock().unwrap();
+            assert_eq!(
+                vmm.instance_info.state,
+                crate::vmm_config::instance_info::VmState::Paused
+            );
+            let mut bytes = [0; 0x1000];
+            memory.read_slice(&mut bytes, GuestAddress(0)).unwrap();
+            assert_eq!(bytes, [0x5a; 0x1000]);
+        }
+        memory.write_slice(&[0xa5], GuestAddress(0)).unwrap();
+        let VmmData::DirtyMemoryRanges(ranges) = controller
+            .handle_request(VmmAction::GetDirtyMemoryRanges)
+            .unwrap()
+        else {
+            panic!("expected ranges")
+        };
+        assert_eq!(ranges.ranges[0].image_offset, 0);
+    }
+
+    #[test]
+    fn test_clear_dirty_memory_slots() {
+        use crate::vstate::memory::Bitmap;
+        // Missing KVM slots fail unless the region records them as unplugged.
+        for (slot_index, unplugged) in [(0, false), (1, false), (2, false), (1, true)] {
+            let mut controller = clear_dirty_memory_controller(true, 0x2000);
+            {
+                let vmm = controller.vmm.lock().unwrap();
+                for region in vmm.vm.guest_memory().iter() {
+                    vmm.vm.guest_memory().mark_dirty(region.start_addr(), 1);
+                }
+                let region = vmm.vm.guest_memory().iter().nth(slot_index).unwrap();
+                let slot = region.plugged_slots().next().unwrap();
+                let mut registration: kvm_bindings::kvm_userspace_memory_region = (&slot).into();
+                registration.memory_size = 0;
+                vmm.vm.set_user_memory_region(registration).unwrap();
+                if unplugged {
+                    region.plugged.lock().unwrap().set(0, false);
+                }
+            }
+            let result = controller.handle_request(VmmAction::ClearDirtyMemory);
+            if unplugged {
+                assert_eq!(result.unwrap(), VmmData::Empty);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(VmmActionError::DirtyMemoryRanges(VmError::GetDirtyLog(_)))
+                ));
+            }
+            let vmm = controller.vmm.lock().unwrap();
+            for region in vmm.vm.guest_memory().iter() {
+                assert_eq!(region.bitmap().dirty_at(0), !unplugged);
+                assert!(!region.bitmap().dirty_at(0x1000));
+            }
+        }
+    }
+
+    #[test]
+    fn test_clear_dirty_memory_activated_queue_pages() {
+        use crate::devices::virtio::device::VirtioDevice;
+        use crate::devices::virtio::transport::mmio::IrqTrigger;
+        use crate::devices::virtio::transport::mmio::tests::DummyDevice;
+        use crate::vstate::memory::{Bitmap, GuestAddress};
+
+        for activated in [false, true] {
+            let mut controller = clear_dirty_memory_controller(true, 0x20000);
+            let mut vmm = controller.vmm.lock().unwrap();
+            let _ = Arc::get_mut(&mut vmm.vm).unwrap().create_vcpus(1).unwrap();
+            let vm = vmm.vm.clone();
+            let memory = vm.guest_memory().clone();
+            let mut device = DummyDevice::new();
+            for (index, queue) in device.queues_mut().iter_mut().enumerate() {
+                queue.ready = true;
+                let base = 0x1000 + index as u64 * 0x3000;
+                queue.desc_table_address = GuestAddress(base);
+                queue.avail_ring_address = GuestAddress(base + 0x1000);
+                queue.used_ring_address = GuestAddress(base + 0x2000);
+            }
+            if activated {
+                device
+                    .activate(memory.clone(), Arc::new(IrqTrigger::new()))
+                    .unwrap();
+            }
+            let device = Arc::new(Mutex::new(device));
+            vmm.device_manager
+                .mmio_devices
+                .register_virtio_test_device(
+                    &vm,
+                    memory.clone(),
+                    device,
+                    &mut crate::builder::tests::default_kernel_cmdline(),
+                    "clear-queue-test",
+                )
+                .unwrap();
+            memory.reset_dirty();
+            memory.mark_dirty(GuestAddress(0x10000), 1);
+            drop(vmm);
+            for _ in 0..2 {
+                assert_eq!(
+                    controller
+                        .handle_request(VmmAction::ClearDirtyMemory)
+                        .unwrap(),
+                    VmmData::Empty
+                );
+                let region = memory.iter().next().unwrap();
+                for page in 1..=6 {
+                    assert_eq!(region.bitmap().dirty_at(page * 0x1000), activated);
+                }
+                assert!(!region.bitmap().dirty_at(0x10000));
+            }
         }
     }
 

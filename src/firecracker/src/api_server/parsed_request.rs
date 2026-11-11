@@ -26,7 +26,9 @@ use super::request::mmds::{parse_get_mmds, parse_patch_mmds, parse_put_mmds};
 use super::request::net::{parse_patch_net, parse_put_net};
 use super::request::pmem::parse_put_pmem;
 use super::request::prefault::parse_put_pre_fault_memory;
-use super::request::snapshot::{parse_patch_vm_state, parse_put_snapshot};
+use super::request::snapshot::{
+    parse_patch_vm_state, parse_put_clear_dirty_memory, parse_put_snapshot,
+};
 use super::request::version::parse_get_version;
 use super::request::vsock::parse_put_vsock;
 use crate::api_server::request::hotplug::memory::{
@@ -113,11 +115,17 @@ impl TryFrom<&Request> for ParsedRequest {
             (Method::Put, "serial", Some(body)) => parse_put_serial(body),
             (Method::Put, "machine-config", Some(body)) => parse_put_machine_config(body),
             (Method::Put, "metrics", Some(body)) => parse_put_metrics(body),
-            (Method::Put, "vm", Some(body))
-                if path_tokens.next() == Some("pre-fault-memory")
-                    && path_tokens.next().is_none() =>
-            {
-                parse_put_pre_fault_memory(body)
+            (Method::Put, "vm", Some(body)) => {
+                match (path_tokens.next(), path_tokens.next(), path_tokens.next()) {
+                    (Some("pre-fault-memory"), None, None) => parse_put_pre_fault_memory(body),
+                    (Some("dirty-memory-ranges"), Some("clear"), None) => {
+                        parse_put_clear_dirty_memory(body)
+                    }
+                    _ => Err(RequestError::InvalidPathMethod(
+                        "vm".to_string(),
+                        Method::Put,
+                    )),
+                }
             }
             (Method::Put, "mmds", Some(body)) => parse_put_mmds(body, path_tokens.next()),
             (Method::Put, "network-interfaces", Some(body)) => {
@@ -855,6 +863,31 @@ pub mod tests {
             vmm_action_from_request(parsed),
             VmmAction::GetGuestMemoryRegions
         );
+    }
+
+    #[test]
+    fn test_try_from_clear_dirty_memory() {
+        assert_eq!(
+            vmm_action_from_request(
+                parse_http_request("PUT", "/vm/dirty-memory-ranges/clear", Some("{}")).unwrap()
+            ),
+            VmmAction::ClearDirtyMemory
+        );
+    }
+
+    #[test]
+    fn test_try_from_clear_dirty_memory_invalid_requests() {
+        let cases = [
+            ("PUT", "/vm/dirty-memory-ranges/clear", None),
+            ("PUT", "/vm/dirty-memory-ranges/clear/extra", Some("{}")),
+            ("PUT", "/vm/dirty-memory-ranges", Some("{}")),
+        ];
+        for (method, path, body) in cases {
+            assert!(
+                parse_http_request(method, path, body).is_err(),
+                "{method} {path} {body:?}"
+            );
+        }
     }
 
     #[test]
