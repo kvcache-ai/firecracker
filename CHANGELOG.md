@@ -8,6 +8,8 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [1.15.1-patch-v3]
+
 ### Added
 
 - Add `PUT /vm/dirty-memory-ranges/clear` to clear committed dirty records while
